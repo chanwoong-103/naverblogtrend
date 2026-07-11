@@ -28,6 +28,7 @@ jobs:
         run: |
           mkdir -p dist
           cp index.html dist/
+          cp robots.txt dist/
 
       - name: Netlify에 배포
         env:
