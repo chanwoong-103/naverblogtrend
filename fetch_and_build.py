@@ -535,6 +535,12 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     overall = tabs.get("전체", [])
     top_n = len(overall) if overall else TOP_N  # 헤더의 "TOP N" 숫자
 
+    # 하단 안내 문구: 협찬 제외 건수는 항상 표시하고, 내돈내산 지수 기준으로
+    # 필터링하는 기능(MIN_GENUINE_RATIO_TO_SHOW)이 켜져 있으면 그 기준도 같이 안내한다
+    filter_note = f"협찬·광고·체험단 추정 게시물 {total_filtered}건 제외"
+    if MIN_GENUINE_RATIO_TO_SHOW is not None:
+        filter_note += f" · 내돈내산 지수 {MIN_GENUINE_RATIO_TO_SHOW}% 이상 게시글로만 집계"
+
     # --- 탭 버튼 + 탭 내용물을 미리 문자열로 만들어두기 -------------------------
     # tabs 딕셔너리를 순서대로 돌면서, 탭마다 버튼 하나 + 내용판(panel) 하나씩 생성.
     # 첫 번째 탭(idx==0)만 처음부터 화면에 보이도록 "active" 클래스를 붙인다.
@@ -880,7 +886,7 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
   <div class="tabs">
     {tab_buttons_html}
   </div>
-  <p class="filter-note">협찬·광고·체험단 추정 게시물 {total_filtered}건 제외 후 집계</p>
+  <p class="filter-note">{filter_note}</p>
   <!-- 탭 내용물 (카드 목록들) - tab_panels_html이 여기 들어감.
        JS가 탭 버튼 클릭에 맞춰 이 중 하나만 보이게(active) 전환해준다 -->
   <div class="list">
