@@ -59,9 +59,22 @@ CANDIDATE_REGIONS = [
  
 HOT_REGION_COUNT = 10
 
+# 주의: 네이버 지역검색 API는 한 번 호출에 display가 최대 5건까지만 나옵니다(공식 제한,
+# start도 페이지네이션 불가). 그래서 지역당 후보를 더 모으려면 검색어 자체를 여러 개로
+# 나눠서 여러 번 호출한 뒤 합치는 방식을 씁니다 (REGION_QUERY_VARIANTS 참고).
+# DISPLAY_PER_REGION은 "그렇게 모은 후보를 최대 몇 개까지 쓸지"를 뜻하는 목표치입니다.
 DISPLAY_PER_REGION = 20
 TOP_N = 8
 TOP_N_PER_REGION = 5
+
+# 지역당 후보 식당을 모을 때 "{지역} {검색어}" 형태로 붙여서 순서대로 호출합니다.
+# 한 검색어당 최대 5건까지 나오므로, DISPLAY_PER_REGION(예: 20)에 도달할 때까지
+# 아래 목록을 앞에서부터 사용합니다. 카페/고기/일식처럼 업종 키워드를 섞으면
+# 카테고리 필터 버튼에 쓸 다양성도 같이 확보됩니다.
+REGION_QUERY_VARIANTS = [
+    "맛집", "맛집 추천", "인기 맛집", "숨은 맛집", "맛집 웨이팅",
+    "한식 맛집", "카페", "고기 맛집", "일식 맛집", "술집",
+]
 
 OG_IMAGE_URL = "https://i.postimg.cc/gJhgW7Zz/seukeulinsyas-2026-07-11-131250.png"
 
@@ -75,4 +88,4 @@ DATALAB_ENABLED = True
 
 # Google Search Console / 네이버 서치어드바이저 소유자 인증 코드
 GOOGLE_SITE_VERIFICATION = "4s0dnp-FGF5U2IvnGgkdTJ9J7cSvb9Iuk697bEm_yCk"
-NAVER_SITE_VERIFICATION = "5b16e1e93327885af85da9fe67dcfd519701094a" 
+NAVER_SITE_VERIFICATION = "5b16e1e93327885af85da9fe67dcfd519701094a"
