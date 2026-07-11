@@ -5,19 +5,32 @@
 ================================================
 
 동작 방식 (상태 저장 없이 매번 완결되는 구조):
-  1. 네이버 지역검색 API로 지역별 맛집 후보 목록을 가져온다.
-  2. 네이버 블로그검색 API로 각 식당 이름의 최근 블로그 게시물을 가져온다.
-     (응답에 postdate가 포함되어 있어 DB 없이도 "이번 주 vs 지난 주" 계산 가능)
-  3. 이번 주 언급 수 - 지난 주 언급 수(증가폭) 기준으로 TOP 8을 뽑는다.
-  4. 결과를 index.html로 바로 렌더링한다.
+  1. (선택) CORE_REGIONS + CANDIDATE_REGIONS 화제성 비교로 이번에 쓸 지역을 정한다.
+  2. 네이버 지역검색 API로 지역별 맛집 후보 목록을 가져온다.
+  3. 네이버 블로그검색 API로 각 식당 이름의 최근 블로그 게시물을 가져온다.
+     (응답에 postdate가 포함되어 있어 DB 없이도 "이번 주 vs 지난 주" 계산 가능.
+     달력 기준이 아니라 "실행 시점 기준 최근 7일 vs 그 전 7일"을 매번 새로 계산하는
+     롤링 방식이라, 매일 실행하면 매일 최신 트렌드로 갱신된다.)
+  4. 협찬/광고 추정 게시물은 집계에서 제외한다.
+  5. 이번 주 언급 수 - 지난 주 언급 수(증가폭) 기준으로 식당 TOP N, 지역 랭킹을 뽑는다.
+  6. 결과를 index.html(웹페이지) + robots.txt(검색로봇 안내 파일)로 렌더링한다.
+
+주요 기능:
+  - 전체 / 지역랭킹 / 지역별 탭 (탭 클릭으로 화면 전환)
+  - 카드 클릭 시 네이버 지도로 바로 연결
+  - 카톡/문자 공유 시 미리보기 카드(썸네일/제목/설명) 표시
+  - Google Search Console / 네이버 서치어드바이저 소유자 인증 지원
+  - 지역 자동 선정 (고정 지역 + 화제성 상위 후보 지역 자동 조합)
 
 사전 준비:
   - https://developers.naver.com 에서 애플리케이션 등록
-  - 사용 API로 "검색" 중 "지역"과 "블로그"를 반드시 체크
+  - 사용 API로 "검색" 카테고리를 체크 (지역검색/블로그검색 모두 포함됨)
   - 발급받은 Client ID / Client Secret을 config.py 에 입력
 
 실행:
   python fetch_and_build.py
+
+전체 설정 옵션은 config.example.py에 전부 주석과 함께 정리되어 있습니다.
 
 주의: 이 환경(샌드박스)은 openapi.naver.com에 네트워크 접근이 차단되어 있어
       실행 테스트는 본인 PC(또는 서버)에서 해야 합니다.
@@ -33,11 +46,22 @@ import urllib.parse
 from html import unescape
 
 try:
+    # --- 필수 설정값 (config.py에 반드시 있어야 함) ---------------------------
     from config import CLIENT_ID, CLIENT_SECRET, REGIONS, DISPLAY_PER_REGION, TOP_N
-    # 환경변수(예: GitHub Actions Secrets)가 있으면 config.py 값보다 우선 적용
-    # -> 자동화 파이프라인에서는 config.py에 실제 키를 적어두지 않아도 됨
+
+    # 환경변수(예: GitHub Actions Secrets)가 있으면 config.py 값보다 우선 적용한다.
+    # -> 이렇게 하면 GitHub에 올리는 config.py에는 진짜 API 키를 안 적어도 되고,
+    #    대신 GitHub Secrets에 등록해둔 값을 자동으로 가져다 쓴다 (키 노출 방지).
+    # -> 로컬(내 컴퓨터)에서 그냥 실행할 때는 이 환경변수가 없으므로,
+    #    config.py에 적어둔 값이 그대로 쓰인다.
     CLIENT_ID = os.environ.get("NAVER_CLIENT_ID", CLIENT_ID)
     CLIENT_SECRET = os.environ.get("NAVER_CLIENT_SECRET", CLIENT_SECRET)
+
+    # --- 선택 설정값들 (아래는 전부 "config.py에 없어도 기본값으로 동작") --------
+    # 패턴: try에서 config.py 값을 읽어보고, 없으면(ImportError) except에서
+    #       기본값을 대신 넣어준다. 이 덕분에 새 기능이 추가돼도 예전 config.py를
+    #       쓰던 사람이 에러 없이 계속 실행할 수 있다 (하위 호환).
+
     try:
         from config import OG_IMAGE_URL
     except ImportError:
@@ -59,7 +83,8 @@ try:
     try:
         from config import EXTRA_BADGES
     except ImportError:
-        # 기존에 PERSONAL_BADGE_TEXT를 쓰던 config.py와도 호환되도록 처리
+        # 기존에 PERSONAL_BADGE_TEXT(문구 1개짜리 옛날 방식)를 쓰던 config.py와도
+        # 호환되도록, 그 값이 있으면 리스트 형태로 자동 변환해서 재사용한다.
         try:
             from config import PERSONAL_BADGE_TEXT
             EXTRA_BADGES = [PERSONAL_BADGE_TEXT] if PERSONAL_BADGE_TEXT else []
@@ -90,6 +115,7 @@ try:
     except ImportError:
         HOT_REGION_COUNT = 3  # 후보 지역 중 화제성 상위 몇 개를 골라 추가할지
 except ImportError:
+    # CLIENT_ID 등 "필수" 설정값 import 자체가 실패했다는 뜻 = config.py가 아예 없음
     raise SystemExit(
         "config.py가 없습니다. config.example.py를 config.py로 복사한 뒤 "
         "네이버 API 키와 지역 목록을 입력하세요."
@@ -100,39 +126,54 @@ REQUEST_DELAY_SEC = 0.15  # 네이버 API 과호출 방지용 딜레이
 
 
 def _naver_get(path: str, params: dict) -> dict:
-    """네이버 오픈API 공통 호출 함수"""
+    """
+    네이버 오픈API를 호출하는 공통 함수.
+    path 예: "local.json"(지역검색), "blog.json"(블로그검색)
+    params는 그대로 URL 쿼리 파라미터로 붙는다 (query, display, start, sort 등).
+    """
     url = f"{NAVER_API_BASE}/{path}?{urllib.parse.urlencode(params)}"
     req = urllib.request.Request(url)
+    # 네이버 API는 URL이 아니라 요청 헤더에 인증 정보를 담아서 보내는 방식이다
     req.add_header("X-Naver-Client-Id", CLIENT_ID)
     req.add_header("X-Naver-Client-Secret", CLIENT_SECRET)
     with urllib.request.urlopen(req, timeout=10) as resp:
         body = resp.read().decode("utf-8")
-    time.sleep(REQUEST_DELAY_SEC)
+    time.sleep(REQUEST_DELAY_SEC)  # 짧은 시간에 너무 많이 호출하지 않도록 매번 살짝 쉬어준다
     return json.loads(body)
 
 
 def strip_tags(text: str) -> str:
-    """네이버 응답의 <b> 태그 등을 제거하고 HTML 엔티티를 복원"""
+    """
+    네이버 API 응답 텍스트에는 검색어 강조용 <b> 태그와 &amp; 같은 HTML 엔티티가
+    섞여서 온다. 이걸 순수 텍스트로 정리해주는 함수.
+    """
     return unescape(re.sub(r"<[^>]+>", "", text)).strip()
 
 
 def get_candidate_restaurants(region: str, display: int = 20) -> list:
-    """지역검색 API로 '{region} 맛집' 후보 식당 이름 목록을 가져온다"""
+    """
+    지역검색 API로 "{region} 맛집"을 검색해서 후보 식당 이름 목록을 가져온다.
+    예: get_candidate_restaurants("강남") -> ["OO식당", "XX카페", ...]
+    """
     data = _naver_get("local.json", {
         "query": f"{region} 맛집",
         "display": display,
-        "sort": "random",
+        "sort": "random",  # 매번 똑같은 상위 업체만 나오지 않도록 무작위 정렬
     })
     names = []
     for item in data.get("items", []):
         name = strip_tags(item["title"])
-        if name and name not in names:
+        if name and name not in names:  # 같은 이름 중복 제거
             names.append(name)
     return names
 
 
 def is_sponsored_post(title: str, description: str) -> bool:
-    """제목+요약에 협찬/광고성 문구가 포함되어 있는지 확인"""
+    """
+    게시물 제목+요약에 협찬/광고성 문구(SPONSORED_KEYWORDS)가 하나라도
+    포함되어 있으면 True를 반환한다. (본문 전체는 API로 못 가져오므로
+    제목+요약만 검사 - 본문 뒷부분에만 문구가 있으면 못 잡을 수 있음)
+    """
     text = strip_tags(title) + " " + strip_tags(description)
     return any(keyword in text for keyword in SPONSORED_KEYWORDS)
 
@@ -148,6 +189,9 @@ def get_weekly_mention_counts(restaurant_name: str, today: datetime.date) -> tup
     지난 주 시작일보다 오래된 게시물이 나오면 그 지점에서 바로 중단한다
     (게시물이 적은 대부분의 식당은 1번 호출만으로 끝나서 API 낭비가 없다).
     """
+    # "이번 주"="오늘부터 7일 전까지", "지난 주"="8~14일 전까지" - 달력 기준이 아니라
+    # 실행하는 날짜(today) 기준으로 매번 새로 계산되는 롤링(rolling) 방식이다.
+    # 그래서 이 스크립트를 매일 실행하면, 매일 최신 7일 트렌드가 갱신된다.
     this_week_start = today - datetime.timedelta(days=7)
     last_week_start = today - datetime.timedelta(days=14)
 
@@ -155,44 +199,49 @@ def get_weekly_mention_counts(restaurant_name: str, today: datetime.date) -> tup
     last_week_count = 0
     filtered_count = 0
 
+    # start=1부터 100씩 늘려가며 페이지를 넘긴다 (네이버 API는 한 번에 최대 100건만 줌)
     start = 1
     while start <= MAX_BLOG_RESULTS:
         data = _naver_get("blog.json", {
             "query": restaurant_name,
             "display": 100,
             "start": start,
-            "sort": "date",
+            "sort": "date",  # 최신순 정렬 - 오래된 글이 나오면 바로 멈출 수 있어서 효율적
         })
         items = data.get("items", [])
         if not items:
-            break
+            break  # 더 이상 게시물이 없으면 종료
 
         reached_older_post = False
         for item in items:
             postdate_str = item.get("postdate", "")
             if not postdate_str or len(postdate_str) != 8:
-                continue
+                continue  # 날짜 정보가 없는 이상한 게시물은 건너뜀
             try:
                 post_date = datetime.datetime.strptime(postdate_str, "%Y%m%d").date()
             except ValueError:
                 continue
 
             if post_date < last_week_start:
+                # 14일보다 오래된 글이 나왔다 = 최신순 정렬이므로 이 뒤로는
+                # 전부 더 오래된 글이라는 뜻 -> 더 볼 필요 없이 바로 중단
                 reached_older_post = True
-                break  # 최신순이므로 여기서부터는 더 볼 필요 없음
+                break
 
             if post_date > today:
-                continue
+                continue  # 혹시 미래 날짜로 잘못 찍힌 데이터 방어
 
             if is_sponsored_post(item.get("title", ""), item.get("description", "")):
                 filtered_count += 1
-                continue
+                continue  # 협찬/광고 추정 게시물은 집계에서 제외
 
             if post_date >= this_week_start:
                 this_week_count += 1
             else:
                 last_week_count += 1
 
+        # 오래된 글에 도달했거나(더 볼 필요 없음), 이 페이지가 100건 미만이었다면
+        # (=마지막 페이지) 여기서 멈춘다. 그렇지 않으면 다음 100건을 더 가져온다.
         if reached_older_post or len(items) < 100:
             break
         start += 100
@@ -248,14 +297,14 @@ def build_ranking() -> tuple:
 
         for name in candidates:
             if name in seen_names:
-                continue
+                continue  # 이미 다른 지역에서 나왔던 식당이면 중복 집계 방지
             seen_names.add(name)
 
             this_week, last_week, filtered = get_weekly_mention_counts(name, today)
             total_filtered += filtered
             if filtered:
                 print(f"    (협찬/광고 추정 {filtered}건 제외)")
-            growth = this_week - last_week
+            growth = this_week - last_week  # 이게 바로 "급상승" 순위를 매기는 핵심 숫자
 
             # 최소 언급량 필터: 우연히 1~2건 튄 걸 급상승으로 착시하지 않도록
             if this_week < 2:
@@ -271,57 +320,70 @@ def build_ranking() -> tuple:
             })
             print(f"  - {name}: 이번주 {this_week} / 지난주 {last_week} (증가 {growth})")
 
+    # growth(증가폭) 큰 순서로 정렬. growth가 같으면 this_week가 큰 쪽을 우선(동점 처리)
     results.sort(key=lambda x: (x["growth"], x["this_week"]), reverse=True)
     print(f"\n총 협찬/광고 추정 제외 건수: {total_filtered}건")
     return results, total_filtered  # 자르지 않고 전체 반환 - 지역별 탭 계산에 필요
 
 
 def build_region_ranking(all_results: list) -> list:
-    """지역별로 증가폭 합계를 집계해 '어느 동네가 가장 뜨는지' 랭킹을 만든다"""
-    agg = {}
+    """
+    지역별로 증가폭 합계를 집계해 '어느 동네가 가장 뜨는지' 랭킹을 만든다.
+    (개별 식당 랭킹과는 별개로, 지역 단위로 다시 한번 합산하는 것)
+    """
+    agg = {}  # {"강남": {누적 통계...}, "성수": {...}, ...}
     for r in all_results:
         region = r["region"]
         if region not in agg:
+            # 이 지역을 처음 만났으면 0으로 초기화
             agg[region] = {
                 "region": region,
                 "total_growth": 0,
                 "total_this_week": 0,
                 "total_last_week": 0,
-                "count": 0,
+                "count": 0,  # 이 지역에서 조건을 만족한 식당이 몇 개였는지
             }
         agg[region]["total_growth"] += r["growth"]
         agg[region]["total_this_week"] += r["this_week"]
         agg[region]["total_last_week"] += r["last_week"]
         agg[region]["count"] += 1
     ranking = list(agg.values())
-    ranking.sort(key=lambda x: x["total_growth"], reverse=True)
+    ranking.sort(key=lambda x: x["total_growth"], reverse=True)  # 증가폭 합계 큰 지역이 위로
     return ranking
 
 
 def build_tabs(all_results: list, region_ranking: list) -> dict:
     """
     전체 결과에서 '전체' 탭 + '지역랭킹' 탭 + 지역별 탭 데이터를 만든다.
+    반환값은 {"탭 이름": [카드로 보여줄 데이터 목록], ...} 형태의 딕셔너리.
     REGIONS에 새 지역이 추가되면, 다음 실행 시 자동으로 그 지역 탭도 생긴다
     (코드 수정 불필요 - config.py의 REGIONS만 바뀌면 됨).
     """
-    tabs = {"전체": all_results[:TOP_N]}
+    tabs = {"전체": all_results[:TOP_N]}  # 첫 번째 탭은 항상 "전체" (전 지역 통합 TOP N)
     if region_ranking:
-        tabs["지역랭킹"] = region_ranking
+        tabs["지역랭킹"] = region_ranking  # 두 번째 탭 = 지역별 랭킹 (데이터 있을 때만)
     for region in REGIONS:
         region_results = [r for r in all_results if r["region"] == region]
-        if region_results:  # 데이터가 있는 지역만 탭으로 생성
+        if region_results:  # 데이터가 있는 지역만 탭으로 생성 (빈 탭 방지)
             tabs[region] = region_results[:TOP_N_PER_REGION]
     return tabs
 
 
 def naver_map_link(name: str, region: str) -> str:
-    """식당 이름+지역으로 네이버 지도 검색 링크를 만든다 (좌표 없이도 동작하는 방식)"""
-    query = urllib.parse.quote(f"{name} {region}")
+    """
+    식당 이름+지역으로 네이버 지도 검색 링크를 만든다.
+    실제 좌표(위도/경도) 없이 "이름으로 검색"하는 방식이라 구현이 간단하고,
+    네이버 지도가 알아서 가장 근접한 결과를 찾아 보여준다.
+    """
+    query = urllib.parse.quote(f"{name} {region}")  # 한글 등을 URL에 넣을 수 있게 인코딩
     return f"https://map.naver.com/p/search/{query}"
 
 
 def render_region_cards(ranking: list) -> str:
-    """지역 랭킹 카드 목록을 HTML로 렌더링 ('지역랭킹' 탭 전용)"""
+    """
+    '지역랭킹' 탭 전용 카드 렌더러. render_cards()와 모양은 비슷하지만
+    식당 하나가 아니라 "지역 하나"를 카드 하나로 보여준다는 점이 다르다.
+    """
     if not ranking:
         return '<p style="text-align:center;color:#999;padding:20px 0;">데이터가 없습니다.</p>'
     rows_html = ""
@@ -344,7 +406,10 @@ def render_region_cards(ranking: list) -> str:
 
 
 def render_cards(items: list) -> str:
-    """식당 카드 목록을 HTML로 렌더링 (탭 하나 분량)"""
+    """
+    일반 탭("전체", 지역별 탭)에서 쓰는 식당 카드 렌더러.
+    각 식당을 카드 하나로 만들고, 클릭하면 네이버 지도로 연결되는 링크(<a>)로 감싼다.
+    """
     if not items:
         return '<p style="text-align:center;color:#999;padding:20px 0;">데이터가 없습니다.</p>'
     rows_html = ""
@@ -368,19 +433,29 @@ def render_cards(items: list) -> str:
 
 def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html"):
     """
-    tabs: {"전체": [...], "강남": [...], "성수": [...], ...} 형태의 딕셔너리.
+    tabs 데이터를 실제 웹페이지(index.html) 하나로 만드는 함수.
+    이 함수가 하는 일을 순서대로 요약하면:
+      1) 탭 버튼과 탭 내용(카드들)을 미리 문자열로 만들어둔다
+      2) 그 문자열들을 큰 HTML 템플릿 안에 끼워 넣는다
+      3) 완성된 HTML을 파일로 저장한다
+
+    tabs: {"전체": [...], "지역랭킹": [...], "강남": [...], ...} 형태의 딕셔너리.
     REGIONS에 새 지역이 생기면 build_tabs()가 자동으로 키를 추가해주므로,
     여기서는 tabs에 들어있는 만큼 탭 버튼도 자동으로 늘어난다 (코드 수정 불필요).
     total_filtered: 협찬/광고 추정으로 집계에서 제외된 전체 게시물 건수.
     """
     today_str = datetime.date.today().strftime("%Y년 %m월 %d일")
-    region_tags = " ".join(f"#{r}" for r in REGIONS)
+    region_tags = " ".join(f"#{r}" for r in REGIONS)  # 헤더에 보이는 "#강남 #성수..." 문구
+    # EXTRA_BADGES 리스트에 있는 문구들을 헤더 배지로 하나씩 만든다 (몇 개든 가능)
     extra_badges_html = "".join(
         f'<span class="hero-badge-secondary">{badge}</span>' for badge in EXTRA_BADGES
     )
     overall = tabs.get("전체", [])
-    top_n = len(overall) if overall else TOP_N
+    top_n = len(overall) if overall else TOP_N  # 헤더의 "TOP N" 숫자
 
+    # --- 탭 버튼 + 탭 내용물을 미리 문자열로 만들어두기 -------------------------
+    # tabs 딕셔너리를 순서대로 돌면서, 탭마다 버튼 하나 + 내용판(panel) 하나씩 생성.
+    # 첫 번째 탭(idx==0)만 처음부터 화면에 보이도록 "active" 클래스를 붙인다.
     tab_names = list(tabs.keys())
     tab_buttons_html = ""
     tab_panels_html = ""
@@ -388,9 +463,15 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
         active_btn = " active" if idx == 0 else ""
         active_panel = " active" if idx == 0 else ""
         tab_buttons_html += f'<button class="tab-btn{active_btn}" data-tab="tab-{idx}">{name}</button>'
+        # "지역랭킹" 탭만 다른 모양의 카드(render_region_cards)를 쓰고, 나머지는 식당 카드
         panel_content = render_region_cards(tabs[name]) if name == "지역랭킹" else render_cards(tabs[name])
         tab_panels_html += f'<div class="tab-panel{active_panel}" id="tab-{idx}">{panel_content}</div>'
 
+    # --- 여기부터 실제 HTML 문서 전체를 하나의 긴 문자열로 조립한다 ------------
+    # 구조: <head> 메타태그(검색/공유용 정보) -> <style> CSS -> <body> 실제 화면
+    #       -> <script> 탭 클릭 시 화면 전환 기능
+    # 위에서 미리 만들어둔 tab_buttons_html / tab_panels_html / extra_badges_html
+    # 등이 아래 {중괄호} 자리에 그대로 끼워 넣어진다.
     html = f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -405,10 +486,15 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
 <meta property="og:image" content="{OG_IMAGE_URL}">
 <meta property="og:type" content="website">
 
-<!-- 검색엔진 소유자 인증용 (Google Search Console / 네이버 서치어드바이저) -->
+<!-- 검색엔진 소유자 인증용 (Google Search Console / 네이버 서치어드바이저)
+     GOOGLE_SITE_VERIFICATION / NAVER_SITE_VERIFICATION이 config.py에 없으면
+     빈 문자열이라 아래 줄들은 그냥 빈 줄로 남는다 (에러 없음) -->
 {f'<meta name="google-site-verification" content="{GOOGLE_SITE_VERIFICATION}">' if GOOGLE_SITE_VERIFICATION else ''}
 {f'<meta name="naver-site-verification" content="{NAVER_SITE_VERIFICATION}">' if NAVER_SITE_VERIFICATION else ''}
 
+<!-- 아래 <style> 블록은 전부 화면 디자인(색상/여백/글씨크기)만 담당한다.
+     기능(데이터/로직)과는 무관하니, 디자인만 바꾸고 싶으면 이 안의 숫자/색상 값만
+     조정하면 된다. -->
 <style>
   body {{
     font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
@@ -585,6 +671,7 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
 </style>
 </head>
 <body>
+  <!-- 상단 그라데이션 헤더 영역 (제목, 배지, 지역 태그, 날짜) -->
   <div class="hero">
     <div class="hero-icon">
       <svg width="160" height="160" fill="currentColor" viewBox="0 0 24 24">
@@ -603,13 +690,18 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
       </div>
     </div>
   </div>
+  <!-- 탭 버튼들 (전체/지역랭킹/지역별) - 위에서 만들어둔 tab_buttons_html이 여기 들어감 -->
   <div class="tabs">
     {tab_buttons_html}
   </div>
   <p class="filter-note">협찬·광고·체험단 추정 게시물 {total_filtered}건 제외 후 집계</p>
+  <!-- 탭 내용물 (카드 목록들) - tab_panels_html이 여기 들어감.
+       JS가 탭 버튼 클릭에 맞춰 이 중 하나만 보이게(active) 전환해준다 -->
   <div class="list">
     {tab_panels_html}
   </div>
+  <!-- 탭 전환 기능: 버튼 클릭 시 모든 탭/버튼의 active를 지우고,
+       클릭된 것에만 다시 active를 붙여서 그 내용만 보이게 만든다 -->
   <script>
     document.querySelectorAll('.tab-btn').forEach(function(btn) {{
       btn.addEventListener('click', function() {{
@@ -629,14 +721,29 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
 
 
 if __name__ == "__main__":
+    # 실제 실행 순서 (python fetch_and_build.py 했을 때 위에서 아래로 벌어지는 일):
+
+    # 1) 이번 실행에서 쓸 지역 목록을 확정한다.
+    #    CANDIDATE_REGIONS를 설정 안 했으면 그냥 REGIONS를 그대로 쓰고,
+    #    설정했으면 CORE_REGIONS + 화제성 상위 지역을 합쳐서 새로 만든다.
     REGIONS = resolve_active_regions()
+
+    # 2) 확정된 지역들을 돌면서 식당 후보 수집 -> 언급 수 집계 -> 급상승 순위 계산
     all_results, total_filtered = build_ranking()
+
+    # 3) 식당 랭킹과는 별개로, 지역 단위 랭킹도 따로 집계
     region_ranking = build_region_ranking(all_results)
+
+    # 4) "전체" / "지역랭킹" / 지역별 탭 데이터를 하나의 구조로 정리
     tabs = build_tabs(all_results, region_ranking)
+
+    # 5) 위 데이터를 실제 웹페이지(index.html)로 만들어서 저장
     render_html(tabs, total_filtered)
-    # 원본 데이터도 별도로 저장 (검증/디버깅용)
+
+    # 원본 데이터도 별도로 저장 (검증/디버깅용 - 나중에 "왜 이 순위가 나왔지?" 확인할 때 유용)
     with open("top8_raw.json", "w", encoding="utf-8") as f:
         json.dump(all_results, f, ensure_ascii=False, indent=2)
+
     # 검색로봇 접근 허용 안내 파일 생성 (네이버 서치어드바이저 robots.txt 경고 해소용)
     with open("robots.txt", "w", encoding="utf-8") as f:
         f.write("User-agent: *\nAllow: /\n")
