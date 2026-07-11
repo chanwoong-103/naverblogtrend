@@ -651,6 +651,45 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     overall = tabs.get("전체", [])
     top_n = len(overall) if overall else TOP_N  # 헤더의 "TOP N" 숫자
 
+    # --- SEO 개선 ① 항상 보이는 요약 문장 -------------------------------------
+    # 탭 안에 숨겨진 카드 목록과 별개로, 상위 몇 개 식당 이름을 자연스러운 문장으로
+    # 만들어서 페이지 상단에 "항상 보이는" 텍스트로 넣는다. 검색로봇이 클릭 없이도
+    # 바로 읽을 수 있고, 사람이 봐도 자연스러운 요약이라 정상적인 콘텐츠다.
+    if overall:
+        top_names = [f"{r['name']}({r['region']})" for r in overall[:5]]
+        seo_summary = (
+            f"{today_str} 기준, {region_tags.replace('#', '')} 등 지역에서 "
+            f"네이버 블로그 언급이 급상승한 맛집은 {', '.join(top_names)} 등입니다. "
+            f"협찬·광고 추정 게시물을 제외하고 실제 방문 후기 위주로 집계했습니다."
+        )
+    else:
+        seo_summary = ""
+
+    # --- SEO 개선 ② 구조화 데이터(JSON-LD) -------------------------------------
+    # 검색엔진(특히 Google)이 페이지 내용을 명확히 이해하도록 도와주는 공식 규격.
+    # "이 페이지는 식당 목록이고, 각 항목은 이런 이름/지역이다"를 기계가 읽을 수 있는
+    # 형태로 명시한다. 화면에는 안 보이지만, 숨겨서 속이는 게 아니라 검색엔진 전용으로
+    # 제공하는 정식 메타데이터라 클로킹 문제가 없다 (Google이 공식 지원하는 방식).
+    structured_data = {
+        "@context": "https://schema.org",
+        "@type": "ItemList",
+        "name": "이번 주 블로그 언급 급상승 맛집 TOP 8",
+        "itemListElement": [
+            {
+                "@type": "ListItem",
+                "position": i,
+                "item": {
+                    "@type": "Restaurant",
+                    "name": r["name"],
+                    "areaServed": r["region"],
+                    "servesCuisine": r.get("category", "기타"),
+                },
+            }
+            for i, r in enumerate(overall, start=1)
+        ],
+    }
+    structured_data_json = json.dumps(structured_data, ensure_ascii=False)
+
     # 하단 안내 문구: 협찬 제외 건수는 항상 표시하고, 내돈내산 지수 기준으로
     # 필터링하는 기능(MIN_GENUINE_RATIO_TO_SHOW)이 켜져 있으면 그 기준도 같이 안내한다
     filter_note = f"협찬·광고·체험단 추정 게시물 {total_filtered}건 제외"
@@ -670,6 +709,17 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
         # "지역랭킹" 탭만 다른 모양의 카드(render_region_cards)를 쓰고, 나머지는 식당 카드
         panel_content = render_region_cards(tabs[name]) if name == "지역랭킹" else render_cards(tabs[name])
         tab_panels_html += f'<div class="tab-panel{active_panel}" id="tab-{idx}">{panel_content}</div>'
+
+    # "즐겨찾기" 탭은 서버(파이썬)가 아니라 브라우저(localStorage)가 아는 정보라서
+    # 여기서는 빈 틀만 만들어두고, 실제 내용은 페이지가 열릴 때 JS가 채워 넣는다
+    # (renderFavoritesTab 함수가 담당 - 다른 탭에 이미 그려진 카드들 중
+    # 즐겨찾기 표시된 것만 모아서 이 탭 안에 복사해 넣는 방식)
+    tab_buttons_html += '<button class="tab-btn" data-tab="tab-favorites">♥ 즐겨찾기</button>'
+    tab_panels_html += (
+        '<div class="tab-panel" id="tab-favorites">'
+        '<p style="text-align:center;color:#999;padding:20px 0;">'
+        '아직 즐겨찾기한 맛집이 없어요. 카드의 ♡를 눌러보세요.</p></div>'
+    )
 
     # --- 여기부터 실제 HTML 문서 전체를 하나의 긴 문자열로 조립한다 ------------
     # 구조: <head> 메타태그(검색/공유용 정보) -> <style> CSS -> <body> 실제 화면
@@ -695,6 +745,13 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
      빈 문자열이라 아래 줄들은 그냥 빈 줄로 남는다 (에러 없음) -->
 {f'<meta name="google-site-verification" content="{GOOGLE_SITE_VERIFICATION}">' if GOOGLE_SITE_VERIFICATION else ''}
 {f'<meta name="naver-site-verification" content="{NAVER_SITE_VERIFICATION}">' if NAVER_SITE_VERIFICATION else ''}
+
+<!-- 구조화 데이터(JSON-LD): 검색엔진에게 "이 페이지는 식당 목록이다"를
+     기계가 읽을 수 있는 형태로 명시한다. 화면에는 안 보이지만, Google이 공식
+     지원하는 표준 메타데이터라 클로킹(속임수)이 아니다. -->
+<script type="application/ld+json">
+{structured_data_json}
+</script>
 
 <!-- 아래 <style> 블록은 전부 화면 디자인(색상/여백/글씨크기)만 담당한다.
      기능(데이터/로직)과는 무관하니, 디자인만 바꾸고 싶으면 이 안의 숫자/색상 값만
@@ -812,6 +869,16 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     color: #aaa;
     text-align: center;
   }}
+  .seo-summary {{
+    max-width: 560px;
+    margin: 0 auto 16px;
+    font-size: 13px;
+    line-height: 1.6;
+    color: #666;
+    background: white;
+    border-radius: 12px;
+    padding: 12px 16px;
+  }}
   .list {{
     max-width: 560px;
     margin: 0 auto;
@@ -822,7 +889,7 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
   .card {{
     background: white;
     border-radius: 14px;
-    padding: 16px 18px;
+    padding: 16px 40px 16px 18px;
     display: flex;
     align-items: center;
     gap: 14px;
@@ -840,14 +907,19 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
   }}
   .fav-btn {{
     position: absolute;
-    top: 8px;
+    top: 10px;
     right: 10px;
+    width: 22px;
+    height: 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     background: none;
     border: none;
     font-size: 16px;
     color: #ccc;
     cursor: pointer;
-    padding: 2px;
+    padding: 0;
     line-height: 1;
   }}
   .fav-btn.active {{
@@ -1048,6 +1120,9 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
       </div>
     </div>
   </div>
+  <!-- SEO 개선: 탭으로 숨겨지지 않는, 항상 보이는 요약 문장.
+       사람이 읽어도 자연스러운 한 문장이라 클로킹이 아니라 정상 콘텐츠다. -->
+  {f'<p class="seo-summary">{seo_summary}</p>' if seo_summary else ''}
   <!-- 탭 버튼들 (전체/지역랭킹/지역별) - 위에서 만들어둔 tab_buttons_html이 여기 들어감 -->
   <div class="tabs">
     {tab_buttons_html}
@@ -1153,22 +1228,76 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
       }}
     }}
 
+    // querySelector의 속성값 안에 "나 \가 들어가면 선택자가 깨지므로 직접 이스케이프한다
+    // (CSS.escape()는 일부 구형 브라우저/웹뷰에서 지원이 안 될 수 있어 이 방식을 씀)
+    function escapeAttrValue(value) {{
+      return String(value).replace(/["\\\\]/g, '\\\\$&');
+    }}
+
     function toggleFavorite(btn) {{
       var key = btn.dataset.key;
       var favs = loadFavorites();
       if (favs[key]) {{
         delete favs[key];
-        btn.textContent = '♡';
-        btn.classList.remove('active');
       }} else {{
         favs[key] = true;
-        btn.textContent = '♥';
-        btn.classList.add('active');
       }}
       localStorage.setItem('naver_trend_favorites', JSON.stringify(favs));
+
+      // 같은 식당 카드가 "전체"/지역별 탭 등 여러 곳에 동시에 있을 수 있으므로,
+      // 지금 누른 버튼 하나만이 아니라 같은 key를 가진 버튼을 전부 같이 갱신한다
+      document.querySelectorAll('.fav-btn[data-key="' + escapeAttrValue(key) + '"]').forEach(function(b) {{
+        if (favs[key]) {{
+          b.textContent = '♥';
+          b.classList.add('active');
+        }} else {{
+          b.textContent = '♡';
+          b.classList.remove('active');
+        }}
+      }});
+
+      renderFavoritesTab();
     }}
 
-    // 페이지를 열었을 때, 예전에 즐겨찾기 눌러뒀던 식당이 있으면 하트를 채워서 보여준다
+    // "즐겨찾기" 탭 안에 실제 카드를 채워 넣는 함수. 다른 탭에 이미 그려져 있는
+    // 카드들 중, 지금 즐겨찾기 표시된 것만 골라 복사해서 즐겨찾기 탭에 넣는다.
+    // (별도 데이터를 새로 안 만들고, 화면에 이미 있는 카드를 재사용하는 방식)
+    function renderFavoritesTab() {{
+      var panel = document.getElementById('tab-favorites');
+      if (!panel) return;
+      var favs = loadFavorites();
+      var favKeys = Object.keys(favs).filter(function(k) {{ return favs[k]; }});
+
+      if (favKeys.length === 0) {{
+        panel.innerHTML = '<p style="text-align:center;color:#999;padding:20px 0;">'
+          + '아직 즐겨찾기한 맛집이 없어요. 카드의 ♡를 눌러보세요.</p>';
+        return;
+      }}
+
+      var addedKeys = {{}};
+      var cardsHtml = '';
+      // 즐겨찾기 탭 자신은 검색 대상에서 제외하고, 다른 탭의 카드들만 훑는다
+      document.querySelectorAll('.tab-panel:not(#tab-favorites) .card').forEach(function(card) {{
+        var favBtn = card.querySelector('.fav-btn');
+        if (!favBtn) return;
+        var key = favBtn.dataset.key;
+        if (favs[key] && !addedKeys[key]) {{
+          addedKeys[key] = true;
+          var clone = card.cloneNode(true);
+          // 복제본은 항상 "즐겨찾기된 상태"이므로 하트를 확실히 채워서 보여준다
+          var cloneFavBtn = clone.querySelector('.fav-btn');
+          cloneFavBtn.textContent = '♥';
+          cloneFavBtn.classList.add('active');
+          cardsHtml += clone.outerHTML;
+        }}
+      }});
+
+      panel.innerHTML = cardsHtml || '<p style="text-align:center;color:#999;padding:20px 0;">'
+        + '아직 즐겨찾기한 맛집이 없어요. 카드의 ♡를 눌러보세요.</p>';
+    }}
+
+    // 페이지를 열었을 때, 예전에 즐겨찾기 눌러뒀던 식당이 있으면 하트를 채워서 보여주고,
+    // "즐겨찾기" 탭도 그 내용으로 미리 채워둔다
     (function restoreFavorites() {{
       var favs = loadFavorites();
       document.querySelectorAll('.fav-btn').forEach(function(btn) {{
@@ -1177,6 +1306,7 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
           btn.classList.add('active');
         }}
       }});
+      renderFavoritesTab();
     }})();
   </script>
 </body>
