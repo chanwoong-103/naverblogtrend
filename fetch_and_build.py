@@ -108,6 +108,14 @@ try:
     except ImportError:
         STREAK_HISTORY_FILE = "streak_history.json"  # 연속 상승 기록을 저장할 파일명
     try:
+        from config import DATALAB_ENABLED
+    except ImportError:
+        DATALAB_ENABLED = False  # True로 켜면 데이터랩(검색어 트렌드)으로 검색 관심도 배지를 추가함
+    try:
+        from config import DATALAB_MAX_ITEMS
+    except ImportError:
+        DATALAB_MAX_ITEMS = 8  # "전체" 탭 상위 몇 개까지만 데이터랩을 확인할지 (일일 호출 한도 절약용)
+    try:
         from config import TOP_N_PER_REGION
     except ImportError:
         TOP_N_PER_REGION = 5  # 지역별 탭에는 기본 5개까지만 표시
@@ -153,6 +161,7 @@ except ImportError:
     )
 
 NAVER_API_BASE = "https://openapi.naver.com/v1/search"
+NAVER_DATALAB_URL = "https://openapi.naver.com/v1/datalab/search"  # 검색어 트렌드는 이 별도 주소를 씀
 REQUEST_DELAY_SEC = 0.15  # 네이버 API 과호출 방지용 딜레이
 
 
@@ -171,6 +180,22 @@ def _naver_get(path: str, params: dict) -> dict:
         body = resp.read().decode("utf-8")
     time.sleep(REQUEST_DELAY_SEC)  # 짧은 시간에 너무 많이 호출하지 않도록 매번 살짝 쉬어준다
     return json.loads(body)
+
+
+def _naver_datalab_post(body: dict) -> dict:
+    """
+    데이터랩(검색어 트렌드) API 호출. 지역검색/블로그검색과 달리
+    GET이 아니라 POST + JSON 본문을 쓰는 방식이라 별도 함수로 분리했다.
+    """
+    data_bytes = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(NAVER_DATALAB_URL, data=data_bytes, method="POST")
+    req.add_header("X-Naver-Client-Id", CLIENT_ID)
+    req.add_header("X-Naver-Client-Secret", CLIENT_SECRET)
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        resp_body = resp.read().decode("utf-8")
+    time.sleep(REQUEST_DELAY_SEC)
+    return json.loads(resp_body)
 
 
 def strip_tags(text: str) -> str:
@@ -413,6 +438,58 @@ def apply_streaks(results: list, today: datetime.date) -> None:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 
+def apply_search_trends(results: list, today: datetime.date) -> None:
+    """
+    상위 DATALAB_MAX_ITEMS개 식당에 한해, 데이터랩(검색어 트렌드) API로
+    "실제 검색 관심도가 오르는 중인지"를 추가로 확인해 "search_rising" 키를 채운다.
+    (블로그 포스팅 수와 달리, 이건 사람들이 네이버에 그 이름을 직접 검색한 지표라
+    훨씬 직접적인 관심도 신호다. 다만 하루 호출 한도가 1,000회로 작아서,
+    전체가 아니라 상위 일부에만 적용한다)
+
+    데이터랩은 한 번 호출에 최대 5개 키워드 그룹을 같이 물어볼 수 있어서,
+    5개씩 묶어(batch) 호출 횟수를 최대한 아낀다.
+    """
+    if not DATALAB_ENABLED or not results:
+        return
+
+    targets = results[:DATALAB_MAX_ITEMS]
+    this_week_start = today - datetime.timedelta(days=7)
+
+    # 5개씩 묶어서 처리 (데이터랩 API 한 번 호출당 최대 5개 키워드 그룹 허용)
+    for i in range(0, len(targets), 5):
+        batch = targets[i:i + 5]
+        keyword_groups = [{"groupName": r["name"], "keywords": [r["name"]]} for r in batch]
+        try:
+            data = _naver_datalab_post({
+                "startDate": (today - datetime.timedelta(days=13)).isoformat(),
+                "endDate": today.isoformat(),
+                "timeUnit": "date",
+                "keywordGroups": keyword_groups,
+            })
+        except Exception as e:
+            print(f"    (데이터랩 조회 실패, 이 배치는 건너뜀: {e})")
+            continue
+
+        for r, result_block in zip(batch, data.get("results", [])):
+            this_week_sum = 0.0
+            last_week_sum = 0.0
+            for point in result_block.get("data", []):
+                try:
+                    point_date = datetime.datetime.strptime(point["period"], "%Y-%m-%d").date()
+                except (ValueError, KeyError):
+                    continue
+                if point_date >= this_week_start:
+                    this_week_sum += point.get("ratio", 0)
+                else:
+                    last_week_sum += point.get("ratio", 0)
+
+            if this_week_sum == 0 and last_week_sum == 0:
+                r["search_rising"] = None  # 검색량 자체가 거의 없어 판단 불가 -> 배지 표시 안 함
+            else:
+                r["search_rising"] = this_week_sum > last_week_sum
+            print(f"    (데이터랩: {r['name']} 검색 관심도 {'상승' if r['search_rising'] else '유지/하락' if r['search_rising'] is not None else '데이터 부족'})")
+
+
 def build_ranking() -> tuple:
     """전 지역을 순회하며 급상승 맛집 TOP N을 계산. (결과 리스트, 협찬/광고 추정 총 제외 건수)를 반환"""
     today = datetime.date.today()
@@ -606,6 +683,15 @@ def render_cards(items: list) -> str:
         streak = r.get("streak", 0)
         streak_badge_html = f'<span class="streak-badge">🔥 {streak}일 연속</span>' if streak >= STREAK_MIN_DAYS else ""
 
+        # 검색 관심도 배지: DATALAB_ENABLED가 켜져있고, 실제로 검색량도 오르는 중일 때만 표시
+        # (search_rising이 None이면 "검색량 자체가 거의 없어 판단 불가"라는 뜻이라 배지를 안 보여준다.
+        # False면 "블로그 글은 늘었지만 실제 검색 관심도는 그대로/하락"이라는 뜻이라 이것도 안 보여준다 -
+        # 굳이 부정적인 신호를 배지로 강조할 필요는 없어서, 긍정적일 때만 표시)
+        search_badge_html = (
+            '<span class="search-badge">🔍 검색 관심도 상승</span>'
+            if r.get("search_rising") is True else ""
+        )
+
         rows_html += f"""
         <a class="card" data-category="{category}" href="{map_url}" target="_blank" rel="noopener">
           <button class="fav-btn" data-key="{fav_key}"
@@ -614,6 +700,7 @@ def render_cards(items: list) -> str:
           <div class="info">
             <div class="name">{r['name']} <span class="map-icon">📍</span></div>
             <div class="region">{r['region']} · {category} {genuine_badge_html}</div>
+            {search_badge_html}
           </div>
           <div class="stats">
             <span class="growth">{growth_badge}</span>
@@ -961,6 +1048,16 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     padding: 2px 7px;
     border-radius: 999px;
     display: inline-block;
+  }}
+  .search-badge {{
+    font-size: 10px;
+    font-weight: 700;
+    color: #0f6e9c;
+    background: #e6f4fb;
+    padding: 2px 7px;
+    border-radius: 999px;
+    display: inline-block;
+    margin-top: 4px;
   }}
   .cat-filter {{
     display: flex;
@@ -1316,6 +1413,9 @@ if __name__ == "__main__":
 
     # 2) 확정된 지역들을 돌면서 식당 후보 수집 -> 언급 수 집계 -> 급상승 순위 계산
     all_results, total_filtered = build_ranking()
+
+    # 2-1) (선택 기능, 기본 꺼짐) 상위 몇 개 식당만 데이터랩으로 실제 검색 관심도 추가 확인
+    apply_search_trends(all_results, datetime.date.today())
 
     # 3) 식당 랭킹과는 별개로, 지역 단위 랭킹도 따로 집계
     region_ranking = build_region_ranking(all_results)
