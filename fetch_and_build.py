@@ -651,20 +651,6 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     overall = tabs.get("전체", [])
     top_n = len(overall) if overall else TOP_N  # 헤더의 "TOP N" 숫자
 
-    # --- SEO 개선 ① 항상 보이는 요약 문장 -------------------------------------
-    # 탭 안에 숨겨진 카드 목록과 별개로, 상위 몇 개 식당 이름을 자연스러운 문장으로
-    # 만들어서 페이지 상단에 "항상 보이는" 텍스트로 넣는다. 검색로봇이 클릭 없이도
-    # 바로 읽을 수 있고, 사람이 봐도 자연스러운 요약이라 정상적인 콘텐츠다.
-    if overall:
-        top_names = [f"{r['name']}({r['region']})" for r in overall[:5]]
-        seo_summary = (
-            f"{today_str} 기준, {region_tags.replace('#', '')} 등 지역에서 "
-            f"네이버 블로그 언급이 급상승한 맛집은 {', '.join(top_names)} 등입니다. "
-            f"협찬·광고 추정 게시물을 제외하고 실제 방문 후기 위주로 집계했습니다."
-        )
-    else:
-        seo_summary = ""
-
     # --- SEO 개선 ② 구조화 데이터(JSON-LD) -------------------------------------
     # 검색엔진(특히 Google)이 페이지 내용을 명확히 이해하도록 도와주는 공식 규격.
     # "이 페이지는 식당 목록이고, 각 항목은 이런 이름/지역이다"를 기계가 읽을 수 있는
@@ -868,16 +854,6 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     font-size: 11px;
     color: #aaa;
     text-align: center;
-  }}
-  .seo-summary {{
-    max-width: 560px;
-    margin: 0 auto 16px;
-    font-size: 13px;
-    line-height: 1.6;
-    color: #666;
-    background: white;
-    border-radius: 12px;
-    padding: 12px 16px;
   }}
   .list {{
     max-width: 560px;
@@ -1120,9 +1096,6 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
       </div>
     </div>
   </div>
-  <!-- SEO 개선: 탭으로 숨겨지지 않는, 항상 보이는 요약 문장.
-       사람이 읽어도 자연스러운 한 문장이라 클로킹이 아니라 정상 콘텐츠다. -->
-  {f'<p class="seo-summary">{seo_summary}</p>' if seo_summary else ''}
   <!-- 탭 버튼들 (전체/지역랭킹/지역별) - 위에서 만들어둔 tab_buttons_html이 여기 들어감 -->
   <div class="tabs">
     {tab_buttons_html}
