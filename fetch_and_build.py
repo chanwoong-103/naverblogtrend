@@ -101,6 +101,19 @@ try:
         # "신뢰도 가중 점수"를 쓴다. 기본값 False = 기존처럼 growth 그대로 사용 (하위 호환)
         TRUST_WEIGHTED_RANKING = False
     try:
+        from config import GENUINE_SMOOTHING_K
+    except ImportError:
+        # 베이지안 스무딩 강도(가상 표본 수). 순위 점수(score)를 계산할 때
+        # "표본이 적은 식당의 내돈내산 비율"을 전체 평균 쪽으로 끌어당기는 정도.
+        # 값이 클수록 표본이 많아야 자기 비율을 온전히 인정받는다.
+        GENUINE_SMOOTHING_K = 5
+    try:
+        from config import GENUINE_PRIOR_RATIO
+    except ImportError:
+        # 스무딩의 기준점(사전 확률). 데이터가 전혀 없을 때 가정하는 내돈내산
+        # 비율로, 실측 분포(대부분 5~15%)의 중간값 근처인 10%를 기본값으로 쓴다.
+        GENUINE_PRIOR_RATIO = 0.10
+    try:
         from config import STREAK_MIN_DAYS
     except ImportError:
         STREAK_MIN_DAYS = 3  # 며칠 연속 급상승이어야 "연속 상승" 배지를 보여줄지
@@ -850,10 +863,25 @@ def build_ranking() -> tuple:
                 print(f"    ({name}: 내돈내산 지수 {genuine_ratio}%로 낮아 순위에서 제외)")
                 continue
 
-            # 신뢰도 가중 점수: growth(증가폭)에 내돈내산 지수를 곱해서 보정한 값.
-            # 지수가 낮을수록(애매한 후기 비율이 높을수록) 실제 순위에서 페널티를 받는다.
-            # 표본 부족으로 지수가 없으면(None) 판단 근거가 없으니 그대로(가중치 1.0) 둔다.
-            score = growth * (genuine_ratio / 100 if genuine_ratio is not None else 1.0)
+            # 신뢰도 가중 점수: growth(증가폭)에 내돈내산 비율을 곱해서 보정한 값.
+            #
+            # 주의(과거 버그): 예전에는 표본 부족(genuine_ratio=None)이면 가중치를
+            # 1.0으로 뒀는데, 지수가 있는 식당은 대부분 5~15%(가중치 0.05~0.15)라
+            # 오히려 "데이터가 적을수록 특혜"를 받는 역전이 생겼다 (언급 3건짜리가
+            # +12건짜리를 이기는 실제 사례 발생). 그래서 None 분기를 폐기하고,
+            # 모든 식당에 베이지안 스무딩(라플라스 스무딩)을 일괄 적용한다:
+            #
+            #   보정 비율 = (내돈내산 글 수 + K×P0) / (전체 표본 수 + K)
+            #
+            # 표본이 적으면 자동으로 전체 평균(P0=10%) 근처로 수렴하고, 표본이
+            # 많아질수록 실제 비율을 그대로 따라간다 -> 별도의 표본 수 분기가
+            # 필요 없어진다. (화면에 보이는 "내돈내산 N%" 배지는 이 보정값이
+            # 아니라 기존 그대로 실측 비율 + 표본 수 제한을 사용한다)
+            total_sample = this_week + last_week
+            smoothed_ratio = (genuine + GENUINE_SMOOTHING_K * GENUINE_PRIOR_RATIO) / (
+                total_sample + GENUINE_SMOOTHING_K
+            )
+            score = growth * smoothed_ratio
 
             results.append({
                 "name": name,
@@ -1027,8 +1055,16 @@ def render_cards(items: list) -> str:
         '<button class="sort-btn active" data-sort="rankmetric" onclick="sortByMetric(this)">🔥 급상승순</button>'
         '<button class="sort-btn" data-sort="thisweek" onclick="sortByMetric(this)">💬 언급많은순</button>'
         '<button class="sort-btn" data-sort="genuine" onclick="sortByMetric(this)">✅ 진짜후기순</button>'
-        # 현재 순위 매장 항목 복사(카톡 투표용 등): 지금 화면(필터/정렬 상태 그대로)의 상위 5개 이름만
-        # 줄바꿈으로 복사. margin-left:auto로 정렬 바 우측 끝에 붙는다.
+        # 급상승률순: 절대 증가폭이 아니라 "지난 주 대비 몇 배 뛰었는지"(상대 증가율)
+        # 기준. 블로그 모수가 큰 대형 상권(부산/경주 등)이 절대 증가폭에서 항상
+        # 유리한 체급 문제를 보완해, 소형 상권의 진짜 급상승 매장이 위로 올라온다.
+        '<button class="sort-btn" data-sort="rate" onclick="sortByMetric(this)">📈 급상승률순</button>'
+        '</div>'
+        # 현재 순위 매장 항목 복사(카톡 투표용 등): 지금 화면(필터/정렬 상태 그대로)의
+        # 상위 5개 이름만 줄바꿈으로 복사. 예전엔 정렬 바 우측 끝에 인라인으로 붙어
+        # 있어서 정렬 버튼으로 오인 클릭되기 쉬웠는데, 카드 리스트 직전의 독립된
+        # 한 줄(utility-row)로 분리해 와이드하게 단독 배치한다.
+        '<div class="utility-row">'
         '<button class="vote-btn" onclick="copyVoteList(this)">📊 현재 순위 매장 항목 복사</button>'
         '</div>'
     )
@@ -1106,6 +1142,11 @@ def render_cards(items: list) -> str:
         # (배지에 보이는 "+N" 숫자는 항상 순수 growth를 그대로 보여준다 - 안 바뀜)
         rank_metric_value = r["score"] if TRUST_WEIGHTED_RANKING else r["growth"]
 
+        # "급상승률순" 정렬 기준값: 지난 주 대비 상대 증가율. 분모를 max(지난주, 3)으로
+        # 잡아서, 지난 주 0~2건이었던 초소형 표본이 무한대/과대 배율로 튀는 것을 막는다
+        # (빌드 시점에 계산해서 카드에 심어두고, 정렬은 클라이언트 JS가 수행 - API 비용 0)
+        rate_value = round(r["growth"] / max(r["last_week"], 3), 3)
+
         # 식당 이름은 API에서 오는 외부 데이터라, strip_tags()가 &amp; 등을 일반
         # 문자(&)로 풀어놓은 상태다. 그대로 HTML에 넣으면 이름에 & < > " 가 포함된
         # 식당(예: "밥&술")에서 카드가 깨질 수 있으므로 반드시 이스케이프한다.
@@ -1115,6 +1156,7 @@ def render_cards(items: list) -> str:
         rows_html += f"""
         <a class="card" data-category="{category}" data-rankmetric="{rank_metric_value}"
            data-thisweek="{r['this_week']}" data-genuine="{genuine_for_sort}"
+           data-rate="{rate_value}" data-region="{safe_region}"
            data-mapquery="{map_query}"
            href="{map_url}" target="_blank" rel="noopener">
           <button class="share-btn" data-name="{share_name}" data-map="{map_url}"
@@ -1135,13 +1177,15 @@ def render_cards(items: list) -> str:
           </div>
         </a>"""
 
-    # 랜덤 뽑기/월드컵 버튼은 카드 정렬 대상(card-list) 밖에 별도로 둬서, 정렬 시
+    # 랜덤 뽑기/월드컵/결제 뽑기 버튼은 카드 정렬 대상(card-list) 밖에 별도로 둬서, 정렬 시
     # 카드들이 재배치돼도 항상 맨 아래 고정된다. 월드컵 버튼은 화면에 보이는 카드가
-    # 4개 미만이면 JS(updateWorldcupButton)가 숨기고, 그때 랜덤 버튼이 100%를 차지한다.
+    # 4개 미만이면 JS(updateWorldcupButton)가 숨기고, 나머지 버튼들이 폭을 나눠 갖는다.
+    # 세 버튼 모두 flex:1이라 화면 너비를 균등하게 나눈다.
     pick_btn_html = (
         '<div class="action-row">'
         '<button class="pick-btn" onclick="runRandomPick(this)">🎰 오늘 메뉴 랜덤 추천</button>'
         '<button class="wc-btn" onclick="startWorldcup(this)">🏆 이주의 핫플 월드컵</button>'
+        '<button class="pay-btn" onclick="openPayModal()">💵 결제할 사람 뽑기</button>'
         '</div>'
     )
 
@@ -1221,13 +1265,16 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     여기서는 tabs에 들어있는 만큼 탭 버튼도 자동으로 늘어난다 (코드 수정 불필요).
     total_filtered: 협찬/광고 추정으로 집계에서 제외된 전체 게시물 건수.
     """
-    today_str = kst_today().strftime("%Y년 %m월 %d일")  # 헤더 날짜도 한국 날짜 기준
     # "N분 전 갱신" 표시용 생성 시각. GitHub Actions는 UTC로 돌아가므로 KST(UTC+9)로
     # 변환해서 저장하고, 실제 "지금으로부터 몇 분 전"인지는 브라우저에서 JS로 계산한다
     # (그래야 페이지를 열어둔 채로 시간이 지나도 값이 계속 갱신된다).
     # (datetime.utcnow()는 파이썬에서 사용 중단 예고된 함수라 timezone 방식으로 교체)
     generated_at_kst = kst_now()
     generated_at_iso = generated_at_kst.strftime("%Y-%m-%dT%H:%M:%S+09:00")
+    # 상단 배지에 넣을 오늘 날짜(KST). 예전엔 헤더 우측 하단에 "2026년 07월 12일"
+    # 전체 날짜가 따로 있었는데, 지역 태그와 겹쳐 깨지는 문제로 제거하고
+    # 그 대신 상단 배지를 "07.12 BLINK TREND" 형태로 바꿔 날짜 정보를 유지한다.
+    badge_date = generated_at_kst.strftime("%m.%d")
     region_tags = " ".join(f"#{r}" for r in REGIONS)  # 헤더에 보이는 "#강남 #성수..." 문구
     # EXTRA_BADGES 리스트에 있는 문구들을 헤더 배지로 하나씩 만든다 (몇 개든 가능)
     extra_badges_html = "".join(
@@ -1267,7 +1314,9 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
             for i, r in enumerate(overall, start=1)
         ],
     }
-    structured_data_json = json.dumps(structured_data, ensure_ascii=False)
+    # "<"를 \u003c로 치환: 식당 이름에 "</script>" 같은 문자열이 섞여 들어와도
+    # <script> 블록이 중간에 끊기지 않도록 방어한다 (JSON 의미는 동일하게 유지됨)
+    structured_data_json = json.dumps(structured_data, ensure_ascii=False).replace("<", "\\u003c")
 
     # 하단 안내 문구: 협찬 제외 건수는 항상 표시하고, 내돈내산 지수 기준으로
     # 필터링하는 기능(MIN_GENUINE_RATIO_TO_SHOW)이 켜져 있으면 그 기준도 같이 안내한다
@@ -1418,8 +1467,15 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     font-weight: 700;
     margin-top: 16px;
   }}
+  /* "N분 전 갱신" 문구 전용 독립 행: 지역 태그와 같은 줄에 뭉치지 않게 분리 */
+  .hero-update-row {{
+    margin-top: 8px;
+  }}
   .hero-date {{
+    display: inline-block;
     background: rgba(0,0,0,0.2);
+    color: rgba(255,255,255,0.9);
+    font-weight: 700;
     padding: 5px 10px;
     border-radius: 12px;
     font-size: 11px;
@@ -1870,20 +1926,105 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
   .wc-btn.hidden {{
     display: none;
   }}
+  /* --- 결제할 사람 뽑기 버튼 & 모달 입력 UI --- */
+  .pay-btn {{
+    flex: 1;
+    border: none;
+    background: linear-gradient(to right, #0d9488, #059669);
+    color: white;
+    font-size: 14px;
+    font-weight: 800;
+    padding: 14px;
+    border-radius: 14px;
+    cursor: pointer;
+  }}
+  .pay-field {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin: 10px 0;
+    font-size: 13px;
+    font-weight: 700;
+    color: #666;
+  }}
+  .pay-field input[type="number"] {{
+    width: 72px;
+    padding: 8px 10px;
+    border: 1px solid #eee;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: 700;
+    text-align: center;
+  }}
+  #pay-names {{
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 40vh;       /* 인원이 많아도 모달이 화면을 넘지 않게 */
+    overflow-y: auto;
+    margin: 10px 0;
+  }}
+  #pay-names input {{
+    width: 100%;
+    box-sizing: border-box;
+    padding: 9px 12px;
+    border: 1px solid #eee;
+    border-radius: 10px;
+    font-size: 14px;
+  }}
+  .pay-draw-btn {{
+    width: 100%;
+    margin-top: 6px;
+    border: none;
+    background: linear-gradient(to right, #0d9488, #059669);
+    color: white;
+    font-size: 14px;
+    font-weight: 800;
+    padding: 13px;
+    border-radius: 12px;
+    cursor: pointer;
+  }}
+  body.dark .pay-field input[type="number"],
+  body.dark #pay-names input {{
+    background: #2a2e38;
+    border-color: #3a3f4a;
+    color: #e6e8ec;
+  }}
+  /* 월드컵 선택 버튼: 좁은 화면에서 "지역·카테고리·이름"을 한 줄로 이으면
+     글자가 꺾이거나 잘리므로, 메타(위)/이름(아래) 수직 스택으로 분리한다 */
   .wc-choice {{
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
     width: 100%;
     border: 2px solid #eee;
     background: white;
     color: inherit;
-    font-size: 16px;
-    font-weight: 800;
-    padding: 16px 10px;
+    padding: 13px 10px;
     border-radius: 14px;
     cursor: pointer;
-    word-break: keep-all;
+  }}
+  .wc-choice-meta {{
+    font-size: 11px;
+    font-weight: 700;
+    color: #999;
+  }}
+  .wc-choice-name {{
+    display: block;
+    width: 100%;
+    font-size: 16px;
+    font-weight: 800;
+    white-space: nowrap;      /* 긴 이름은 줄바꿈 대신 */
+    overflow: hidden;         /* 넘치는 부분을 숨기고 */
+    text-overflow: ellipsis;  /* ...으로 잘라 레이아웃 터짐을 방어 */
   }}
   .wc-choice:hover {{
     border-color: #ff5a36;
+    color: #ff5a36;
+  }}
+  .wc-choice:hover .wc-choice-name {{
     color: #ff5a36;
   }}
   .wc-vs {{
@@ -1897,17 +2038,22 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     border-color: #3a3f4a;
   }}
 
-  /* --- 현재 순위 매장 항목 복사 버튼 (정렬 바 우측 끝) --- */
+  /* --- 현재 순위 매장 항목 복사 버튼 --------------------------------------
+     정렬 바 안에 인라인으로 붙어 있으면 정렬 버튼으로 오인 클릭되기 쉬워서,
+     정렬 바와 카드 리스트 사이의 독립된 한 줄(utility-row)에 와이드로 단독 배치 */
+  .utility-row {{
+    margin-bottom: 10px;
+  }}
   .vote-btn {{
-    flex: 0 0 auto;
-    margin-left: auto;
-    border: 1px solid #eee;
+    display: block;
+    width: 100%;
+    border: 1px dashed #ddd;
     background: white;
     color: #666;
     font-size: 12px;
     font-weight: 700;
-    padding: 6px 14px;
-    border-radius: 999px;
+    padding: 9px 14px;
+    border-radius: 12px;
     cursor: pointer;
   }}
   body.dark .vote-btn {{
@@ -2027,13 +2173,18 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     </div>
     <div class="hero-inner">
       <div class="hero-badge-row">
-        <span class="hero-badge">REALTIME BLINK TREND</span>
+        <span class="hero-badge">{badge_date} BLINK TREND</span>
         {extra_badges_html}
       </div>
       <h1>이주의 급상승<br>맛집 TOP {top_n}</h1>
+      <!-- 지역 태그가 늘어나면 우측 시간 문구와 겹쳐 깨지는 문제가 있어서,
+           고정 날짜는 제거하고 "N분 전 갱신" 문구만 태그 아래 독립된 줄로 분리했다
+           (날짜 정보는 어차피 갱신 시각 문구가 대신하므로 중복이었음) -->
       <div class="hero-meta">
         <span>{region_tags}</span>
-        <span class="hero-date">{today_str} · <span id="update-relative">방금 갱신됨</span></span>
+      </div>
+      <div class="hero-update-row">
+        <span class="hero-date"><span id="update-relative">방금 갱신됨</span></span>
       </div>
     </div>
   </div>
@@ -2079,6 +2230,37 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
           <a id="wc-winner-map" href="#" target="_blank" rel="noopener" class="pick-modal-map-btn">지도에서 보기</a>
           <button class="pick-modal-close-btn" onclick="shareWcWinner(this)">🏆 공유</button>
           <button class="pick-modal-close-btn" onclick="closeWorldcup()">닫기</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <!-- 결제할 사람 뽑기 모달: 인원수 -> 실명 입력칸 동적 생성 -> 당첨 인원 설정 ->
+       Math.random 추첨 -> 결과/공유. 서버 통신 없이 100% 브라우저 안에서 동작한다.
+       (참고: 정적 페이지 특성상 <form> 없이 input + 버튼 onclick만으로 구동) -->
+  <div id="pay-modal" class="pick-modal-overlay" onclick="if(event.target===this) closePayModal()">
+    <div class="pick-modal-box">
+      <div class="pick-modal-label">💵 오늘 결제할 사람 뽑기</div>
+      <div id="pay-setup" style="margin-top:6px;">
+        <div class="pay-field">
+          <span>모임 총 인원</span>
+          <input type="number" id="pay-count" min="2" max="12" value="4" inputmode="numeric" oninput="renderPayInputs()">
+        </div>
+        <div id="pay-names"></div>
+        <div class="pay-field">
+          <span>결제 당첨 인원</span>
+          <input type="number" id="pay-winners" min="1" max="12" value="1" inputmode="numeric">
+        </div>
+        <button class="pay-draw-btn" onclick="drawPayers()">🎰 추첨하기</button>
+        <div class="pick-modal-buttons">
+          <button class="pick-modal-close-btn" onclick="closePayModal()">닫기</button>
+        </div>
+      </div>
+      <div id="pay-result" style="display:none;">
+        <div class="pick-modal-name" id="pay-result-names" style="font-size:20px;">-</div>
+        <div class="pick-modal-buttons">
+          <button class="pick-modal-close-btn" onclick="sharePayResult(this)">🎰 결과 카톡 공유</button>
+          <button class="pick-modal-close-btn" onclick="resetPayModal()">다시 뽑기</button>
+          <button class="pick-modal-close-btn" onclick="closePayModal()">닫기</button>
         </div>
       </div>
     </div>
@@ -2185,7 +2367,7 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     function sortByMetric(btn) {{
       var bar = btn.closest('.sort-bar');
       var panel = btn.closest('.tab-panel');
-      var metric = btn.dataset.sort; // 'rankmetric' | 'thisweek' | 'genuine'
+      var metric = btn.dataset.sort; // 'rankmetric' | 'thisweek' | 'genuine' | 'rate'
 
       bar.querySelectorAll('.sort-btn').forEach(function(b) {{ b.classList.remove('active'); }});
       btn.classList.add('active');
@@ -2213,7 +2395,7 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     // --- 공유 버튼: "{{탭 이름}} {{정렬기준}}순 {{순위}}위 - {{이름}}\\n{{지도링크}}" 형태로 클립보드에 복사.
     // 순위/정렬기준은 정적으로 미리 박아두지 않고, 클릭하는 시점에 화면에 보이는 상태
     // (카테고리 필터로 숨겨졌는지, 어떤 정렬 버튼이 활성 상태인지)를 그대로 반영해서 계산한다.
-    var SORT_LABELS = {{ rankmetric: '급상승순', thisweek: '언급많은순', genuine: '진짜후기순' }};
+    var SORT_LABELS = {{ rankmetric: '급상승순', thisweek: '언급많은순', genuine: '진짜후기순', rate: '급상승률순' }};
 
     function shareCard(btn) {{
       var card = btn.closest('.card');
@@ -2473,7 +2655,11 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
         return card.querySelector('.name').childNodes[0].textContent.trim();
       }});
       if (names.length === 0) return;
-      copyTextWithFeedback(names.join('\\n'), btn);
+      // 이름 목록 아래에 빈 줄을 두고 사이트 재유입 유도 꼬리표를 자동 결합한다
+      // (카톡 투표에 붙여넣으면 목록 끝에 링크가 함께 공유되는 바이럴 구조)
+      var text = names.join('\\n')
+        + '\\n\\n더 많은 순위를 보고싶다면?\\n' + SITE_URL;
+      copyTextWithFeedback(text, btn);
     }}
 
     // ==================== 롤링 전광판 (순수 자동 순환) ====================
@@ -2522,7 +2708,11 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
       var entrants = visible.slice(0, size).map(function(card) {{
         return {{
           name: card.querySelector('.name').childNodes[0].textContent.trim(),
-          url: card.href
+          url: card.href,
+          // 수직 스택형 선택 버튼의 상단 메타 정보(지역 · 카테고리)용.
+          // 카드에 심어둔 data 속성에서 읽으므로 추가 연산/통신이 없다.
+          region: card.dataset.region || '',
+          category: card.dataset.category || ''
         }};
       }});
       // 무작위 대진표 (Fisher-Yates 셔플)
@@ -2535,6 +2725,18 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
       document.getElementById('wc-match').style.display = '';
       document.getElementById('wc-modal').classList.add('active');
       renderWcMatch();
+    }}
+
+    // 월드컵 선택 버튼 내부를 "메타(지역 · 카테고리) / 식당 이름" 수직 스택으로 채운다.
+    // 이름은 textContent로 넣어 특수문자(&, < 등)가 있어도 안전하고,
+    // CSS(ellipsis)가 긴 이름을 ...으로 잘라 좁은 화면에서도 안 깨진다.
+    function fillWcChoice(el, entrant) {{
+      el.innerHTML = '<span class="wc-choice-meta"></span><span class="wc-choice-name"></span>';
+      var metaText = entrant.region
+        ? entrant.region + (entrant.category ? ' · ' + entrant.category : '')
+        : (entrant.category || '');
+      el.querySelector('.wc-choice-meta').textContent = metaText || '\u00a0';
+      el.querySelector('.wc-choice-name').textContent = entrant.name;
     }}
 
     function renderWcMatch() {{
@@ -2550,8 +2752,8 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
       var total = wcState.round.length / 2;
       document.getElementById('wc-round-label').textContent =
         '🏆 ' + roundName + ' ' + matchNo + '/' + total + ' - 어디로 갈까요?';
-      document.getElementById('wc-choice-a').textContent = wcState.round[wcState.idx].name;
-      document.getElementById('wc-choice-b').textContent = wcState.round[wcState.idx + 1].name;
+      fillWcChoice(document.getElementById('wc-choice-a'), wcState.round[wcState.idx]);
+      fillWcChoice(document.getElementById('wc-choice-b'), wcState.round[wcState.idx + 1]);
     }}
 
     function wcPick(which) {{
@@ -2583,6 +2785,93 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     function closeWorldcup() {{
       document.getElementById('wc-modal').classList.remove('active');
       wcState = null;
+    }}
+
+    // ==================== 결제할 사람 뽑기 (실명 추첨 미니게임) ====================
+    // 서버/저장소 없이 브라우저 안에서만 동작: 인원수(N) 입력 -> 실명 입력칸 N개
+    // 동적 생성 -> 당첨 인원(M) 설정 -> Fisher-Yates 셔플로 중복 없이 M명 추첨.
+    var payState = null;  // {{ winners: [...], all: [...] }} - 공유 문구 조립용
+
+    function openPayModal() {{
+      payState = null;
+      document.getElementById('pay-result').style.display = 'none';
+      document.getElementById('pay-setup').style.display = '';
+      renderPayInputs();
+      document.getElementById('pay-modal').classList.add('active');
+    }}
+
+    // 인원수(N) 입력값이 바뀔 때마다 실명 입력칸을 N개로 다시 맞춘다.
+    // 이미 입력해둔 이름은 지우지 않고 그대로 보존한 채 개수만 늘리거나 줄인다.
+    function renderPayInputs() {{
+      var countInput = document.getElementById('pay-count');
+      var n = parseInt(countInput.value, 10);
+      if (isNaN(n)) return;  // 지우고 다시 입력하는 중이면 그대로 둔다
+      n = Math.max(2, Math.min(12, n));
+      var box = document.getElementById('pay-names');
+      var existing = Array.prototype.slice.call(box.querySelectorAll('input'));
+      // 부족한 만큼 추가
+      for (var i = existing.length; i < n; i++) {{
+        var input = document.createElement('input');
+        input.type = 'text';
+        input.placeholder = (i + 1) + '번째 멤버 이름';
+        input.maxLength = 20;
+        box.appendChild(input);
+      }}
+      // 넘치는 만큼 뒤에서부터 제거
+      while (box.children.length > n) {{
+        box.removeChild(box.lastChild);
+      }}
+      // 당첨 인원(M)의 상한도 N에 맞춰 보정 (M <= N 유지)
+      var winnersInput = document.getElementById('pay-winners');
+      winnersInput.max = n;
+      if (parseInt(winnersInput.value, 10) > n) winnersInput.value = n;
+    }}
+
+    function drawPayers() {{
+      var inputs = Array.prototype.slice.call(document.querySelectorAll('#pay-names input'));
+      var names = inputs.map(function(input, i) {{
+        var v = input.value.trim();
+        return v || (i + 1) + '번 멤버';  // 빈 칸은 자동 이름으로 대체 (추첨 진행은 막지 않음)
+      }});
+      var n = names.length;
+      if (n < 2) return;
+      var m = parseInt(document.getElementById('pay-winners').value, 10);
+      if (isNaN(m) || m < 1) m = 1;
+      if (m > n) m = n;  // M <= N 강제
+
+      // Fisher-Yates 셔플 후 앞에서 M명 -> 중복 없는 공정한 추첨
+      var pool = names.slice();
+      for (var i = pool.length - 1; i > 0; i--) {{
+        var j = Math.floor(Math.random() * (i + 1));
+        var tmp = pool[i]; pool[i] = pool[j]; pool[j] = tmp;
+      }}
+      var winners = pool.slice(0, m);
+
+      payState = {{ winners: winners, all: names }};
+      document.getElementById('pay-result-names').textContent =
+        '오늘 골든벨의 주인공은 💸 ' + winners.join(', ') + ' 입니다!';
+      document.getElementById('pay-setup').style.display = 'none';
+      document.getElementById('pay-result').style.display = '';
+    }}
+
+    function resetPayModal() {{
+      // 입력했던 이름/인원은 그대로 둔 채 설정 화면으로 돌아가 다시 뽑을 수 있게
+      document.getElementById('pay-result').style.display = 'none';
+      document.getElementById('pay-setup').style.display = '';
+    }}
+
+    function sharePayResult(btn) {{
+      if (!payState) return;
+      var text = '💵 오늘 밥값 낼 사람은 누구?\\n'
+        + nowLabel() + ' 급상승 맛집 모임에서 진행한 밥값 쏘기 내기 결과!\\n\\n'
+        + '🎯 당첨자: **[ ' + payState.winners.join(', ') + ' ]** (축하합니다 👏)\\n'
+        + '(참여자: ' + payState.all.join(', ') + ')\\n\\n'
+        + '⚡ 오늘 방문한 핫플 정보 보기: ' + SITE_URL;
+      shareOrCopy(text, btn);
+    }}
+
+    function closePayModal() {{
+      document.getElementById('pay-modal').classList.remove('active');
     }}
 
     // 페이지 로드 시 각 탭의 월드컵 버튼 노출 조건을 초기 계산
