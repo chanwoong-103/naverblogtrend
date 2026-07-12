@@ -264,7 +264,10 @@ def _urlopen_with_retry(req) -> str:
         if attempt == max_retries:
             print(f"!!! [API 최종 실패] {req.full_url.split('?')[0]}: {last_error}")
             raise last_error
-        backoff = 0.5 * attempt  # 0.5초 -> 1.0초 점진적 대기
+        # 429(과호출)는 "잠깐 쉬라"는 신호라서 0.5초로는 부족한 경우가 많다.
+        # 429일 때만 3초 -> 6초로 넉넉히 쉬고, 그 외 일시 오류는 0.5초 -> 1.0초.
+        is_rate_limited = isinstance(last_error, urllib.error.HTTPError) and last_error.code == 429
+        backoff = (3.0 if is_rate_limited else 0.5) * attempt
         print(f"    [일시적 오류] {last_error} - {backoff}초 후 재시도 ({attempt}/{max_retries})")
         time.sleep(backoff)
 
@@ -371,11 +374,17 @@ def get_candidate_restaurants(region: str, target_count: int = 20) -> list:
     for variant in REGION_QUERY_VARIANTS:
         if len(results) >= target_count:
             break
-        data = _naver_get("local.json", {
-            "query": f"{region} {variant}",
-            "display": 5,  # API 최대치. 5보다 크게 요청해도 어차피 5건까지만 온다.
-            "sort": "random",  # 매번 똑같은 상위 업체만 나오지 않도록 무작위 정렬
-        })
+        try:
+            data = _naver_get("local.json", {
+                "query": f"{region} {variant}",
+                "display": 5,  # API 최대치. 5보다 크게 요청해도 어차피 5건까지만 온다.
+                "sort": "random",  # 매번 똑같은 상위 업체만 나오지 않도록 무작위 정렬
+            })
+        except Exception as e:
+            # 검색어 하나가 재시도 3회 후에도 실패했다고 지역 전체(나아가 빌드 전체)를
+            # 죽일 이유는 없다 - 이 검색어만 건너뛰고 다음 검색어로 계속 모은다.
+            print(f"    ('{region} {variant}' 후보 검색 실패, 이 검색어는 건너뜀: {e})")
+            continue
         for item in data.get("items", []):
             name = strip_tags(item["title"])
             if name and name not in seen:  # 같은 이름 중복 제거 (검색어가 겹쳐서 나오는 경우 방지)
@@ -384,13 +393,21 @@ def get_candidate_restaurants(region: str, target_count: int = 20) -> list:
                 results.append({"name": name, "category": category})
 
     # 오늘 날짜로 캐시에 저장 (내일이 되면 date가 달라져서 자동으로 새로 수집됨)
-    cache.setdefault("regions", {})[region] = results
-    try:
-        with open(CANDIDATE_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
-    except OSError:
-        pass  # 캐시 저장 실패는 치명적이지 않으므로 무시하고 계속
-    return results
+    # 단, 결과가 0개면(API 전면 실패 등) 저장하지 않는다 - 빈 목록이 캐시되면
+    # 그 지역이 "하루 종일" 빈 상태로 굳어버리므로, 다음 실행(2시간 뒤)에서
+    # 다시 수집을 시도할 수 있게 캐시를 비워둔다.
+    if results:
+        cache.setdefault("regions", {})[region] = results
+        try:
+            with open(CANDIDATE_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(cache, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass  # 캐시 저장 실패는 치명적이지 않으므로 무시하고 계속
+    else:
+        print(f"    ({region}: 후보 0개 - 캐시에 저장하지 않고 다음 실행에서 재시도)")
+    # 캐시 재사용 경로와 동일하게 target_count로 잘라 반환 (검색어 하나가 최대
+    # 5건씩 더해지므로 target_count를 살짝 넘길 수 있음 - 동작 일관성 유지)
+    return results[:target_count]
 
 
 def is_sponsored_post(title: str, description: str) -> bool:
@@ -518,13 +535,19 @@ def get_genuine_ratio(this_week_count: int, last_week_count: int, genuine_count:
     return round(genuine_count / total * 100)
 
 
-def get_region_volume(region: str) -> int:
-    """'{지역} 맛집' 블로그 검색의 총 게시물 수를 그 지역 화제성의 근사치로 사용"""
+def get_region_volume(region: str):
+    """
+    '{지역} 맛집' 블로그 검색의 총 게시물 수를 그 지역 화제성의 근사치로 사용.
+    조회 실패 시 None을 반환한다 - 예전에는 실패도 0으로 돌려줬는데, 그 0이
+    하루 단위 캐시에 저장되면 일시적인 API 오류 한 번으로 그 지역이 "하루 종일"
+    화제성 0으로 취급되어 hot pick 후보에서 부당하게 제외되는 문제가 있었다.
+    None(실패)은 캐시에 저장하지 않아 다음 실행에서 자동으로 재조회된다.
+    """
     try:
         data = _naver_get("blog.json", {"query": f"{region} 맛집", "display": 1, "sort": "date"})
         return int(data.get("total", 0))
     except Exception:
-        return 0
+        return None
 
 
 def resolve_active_regions() -> list:
@@ -560,10 +583,17 @@ def resolve_active_regions() -> list:
     for region in CANDIDATE_REGIONS:
         if region in cached_volumes:
             volume = cached_volumes[region]  # 오늘 이미 조회한 값 재사용
+            volumes_to_save[region] = volume
         else:
             volume = get_region_volume(region)
-            print(f"  - {region}: {volume}건")
-        volumes_to_save[region] = volume
+            if volume is None:
+                # 조회 실패 - 캐시에 저장하지 않고(하루 종일 0으로 굳는 것 방지)
+                # 이번 실행에서만 0점 처리. 다음 실행(2시간 뒤)에 자동 재조회된다.
+                print(f"  - {region}: 조회 실패 (이번 실행만 0점, 다음 실행에서 재시도)")
+                volume = 0
+            else:
+                print(f"  - {region}: {volume}건")
+                volumes_to_save[region] = volume
         scored.append((region, volume))
 
     # 오늘 날짜로 캐시 저장 (내일이 되면 date가 달라져서 자동으로 새로 조회됨)
@@ -706,9 +736,12 @@ def apply_trend_history(results: list, today: datetime.date) -> None:
     new_ranks = {_entity_key(r): i for i, r in enumerate(results, start=1)}
     try:
         with open(TREND_HISTORY_FILE, "w", encoding="utf-8") as f:
+            # separators로 공백 없이 압축 저장 - 기록 파일 중 가장 크고(식당당 스파크
+            # 포인트 48개) 2시간마다 data 브랜치에 push되는 파일이라 용량을 아낀다
+            # (indent=2 대비 약 30% 절감. 사람이 볼 일은 드물어 가독성 손해는 미미)
             json.dump({"prev_ranks": new_ranks, "mentions": mentions,
                        "datalab": history.get("datalab", {})}, f,
-                      ensure_ascii=False, indent=2)
+                      ensure_ascii=False, separators=(",", ":"))
     except OSError:
         pass  # 기록 저장 실패는 치명적이지 않으므로 무시하고 계속
 
@@ -727,7 +760,19 @@ def apply_search_trends(results: list, today: datetime.date) -> None:
     if not DATALAB_ENABLED or not results:
         return
 
-    targets = results[:DATALAB_MAX_ITEMS]
+    # 대상 선정: "전체" 탭과 동일하게 이름 기준 중복 제거 후 상위 DATALAB_MAX_ITEMS개.
+    # (예전의 results[:N] 슬라이스는 같은 식당이 두 지역 항목으로 상위권에 들면
+    # 중복이 자리를 차지해, 전체 탭에 실제로 표시되는 N곳을 전부 못 덮었다.
+    # 호출량은 동일 - 어차피 이름 단위로 조회하므로 고유 이름 N개가 상한이다)
+    targets = []
+    _seen_target_names = set()
+    for r in results:
+        if r["name"] in _seen_target_names:
+            continue
+        _seen_target_names.add(r["name"])
+        targets.append(r)
+        if len(targets) == DATALAB_MAX_ITEMS:
+            break
     this_week_start = today - datetime.timedelta(days=7)
     today_str = today.isoformat()
 
@@ -802,9 +847,11 @@ def apply_search_trends(results: list, today: datetime.date) -> None:
     # 오늘 날짜가 아닌 낡은 캐시는 정리하고 파일에 반영 (내일이 되면 자동으로 새로 조회됨)
     datalab_cache = {n: v for n, v in datalab_cache.items() if v.get("date") == today_str}
 
-    # 마무리: 같은 이름의 중복 항목(다른 지역으로 상위권에 함께 든 경우)이나
-    # 배치 실패로 아직 값이 없는 항목에, 방금 채워진 캐시 값을 공유한다
-    for r in targets:
+    # 마무리: 같은 이름의 다른 지역 항목이나 배치 실패로 아직 값이 없는 항목에,
+    # 방금 채워진 캐시 값을 공유한다. targets가 아니라 results 전체를 훑는 이유:
+    # 데이터랩은 "이름 단위" 지표라 지역이 달라도 결과가 같으므로, 이미 조회한
+    # 이름과 같은 식당이 지역 탭에 있으면 추가 호출 없이 배지를 함께 보여줄 수 있다.
+    for r in results:
         if "search_rising" not in r:
             cached = datalab_cache.get(r["name"])
             if cached:
@@ -814,7 +861,8 @@ def apply_search_trends(results: list, today: datetime.date) -> None:
         history["datalab"] = datalab_cache
         try:
             with open(TREND_HISTORY_FILE, "w", encoding="utf-8") as f:
-                json.dump(history, f, ensure_ascii=False, indent=2)
+                # apply_trend_history()의 저장과 동일한 압축 포맷 유지
+                json.dump(history, f, ensure_ascii=False, separators=(",", ":"))
         except OSError:
             pass  # 캐시 저장 실패는 치명적이지 않으므로 무시
 
@@ -840,7 +888,14 @@ def build_ranking() -> tuple:
             # 지역마다 독립적으로 집계하는 게 맞다 (수집 단계에서는 중복 허용).
             # "전체" 탭의 이름 중복 제거는 build_tabs()에서 표시 단계에만 적용한다.
 
-            this_week, last_week, filtered, genuine = get_weekly_mention_counts(name, today, region)
+            # 부분 실패 내성: 재시도 3회 후에도 실패한 식당 1곳 때문에 15분짜리
+            # 빌드 전체(그리고 그 회차에 이미 쓴 수백 건의 API 호출)가 통째로
+            # 죽지 않도록, 해당 식당만 이번 실행에서 건너뛰고 계속 진행한다.
+            try:
+                this_week, last_week, filtered, genuine = get_weekly_mention_counts(name, today, region)
+            except Exception as e:
+                print(f"    ({name}: 언급 수 집계 실패, 이번 실행에서 건너뜀: {e})")
+                continue
             total_filtered += filtered
             if filtered:
                 print(f"    (협찬/광고 추정 {filtered}건 제외)")
