@@ -1027,9 +1027,9 @@ def render_cards(items: list) -> str:
         '<button class="sort-btn active" data-sort="rankmetric" onclick="sortByMetric(this)">🔥 급상승순</button>'
         '<button class="sort-btn" data-sort="thisweek" onclick="sortByMetric(this)">💬 언급많은순</button>'
         '<button class="sort-btn" data-sort="genuine" onclick="sortByMetric(this)">✅ 진짜후기순</button>'
-        # 카톡 투표 항목 복사: 지금 화면(필터/정렬 상태 그대로)의 상위 5개 이름만
+        # 현재 순위 매장 항목 복사(카톡 투표용 등): 지금 화면(필터/정렬 상태 그대로)의 상위 5개 이름만
         # 줄바꿈으로 복사. margin-left:auto로 정렬 바 우측 끝에 붙는다.
-        '<button class="vote-btn" onclick="copyVoteList(this)">📊 카톡투표 항목 복사</button>'
+        '<button class="vote-btn" onclick="copyVoteList(this)">📊 현재 순위 매장 항목 복사</button>'
         '</div>'
     )
 
@@ -1153,24 +1153,30 @@ def render_cards(items: list) -> str:
     )
 
 
-def build_ticker_slides(tabs: dict) -> list:
+def build_ticker_slides(tabs: dict, all_results=None) -> list:
     """
     롤링 전광판(티커)에 순환 표시할 슬라이드 문구들을 만든다.
     모든 연산과 문구 조립을 백엔드(여기)에서 끝내고, 브라우저 JS는 7초마다
     슬라이드를 전환만 한다 (100% 정적 SSR 원칙 유지, 인터랙션 없음).
+
+    중요: 내돈내산 1위(Slide 3)와 스테디 매장(Slide 4)은 화면의 "전체" 탭
+    (상위 8개)이 아니라 all_results(수집된 전체 식당) 중에서 뽑아야 한다.
+    지역 탭에만 있는 매장이 더 높은 지수/더 긴 연속 기록을 가질 수 있기 때문.
+    (Slide 1은 전 지역 합산 기반, Slide 2는 전국 1위 = 전체 탭 1위라 영향 없음)
 
     Slide 1 - 상권 대첩 헤드라인 (지역랭킹 기반, 계층형 분기):
       1순위: 1위 지역 증가폭이 0 이하 -> 전체 침체 문구
       2순위: 1위는 양수인데 2위 지역이 없음 -> 단독 독점 문구
       3순위: 2위/1위 비율이 0.90 이상 -> 초박빙 문구
       4순위: 그 외 -> 일반 격차 문구
-    Slide 2 - 급상승 1위 식당 (전체 탭 1위)
+    Slide 2 - 급상승 1위 식당
     Slide 3 - 내돈내산 지수 최고 식당 (유효 지수 보유 식당이 1곳도 없으면 슬라이드 제외)
     Slide 4 - 연속 상승(스테디) 식당 (streak >= STREAK_MIN_DAYS 매장 있을 때만 포함)
     """
     slides = []
     region_ranking = tabs.get("지역랭킹") or []
-    overall = tabs.get("전체") or []
+    # 슬라이드 2~4의 후보 풀: 전체 식당 목록이 있으면 그걸, 없으면(하위 호환) 전체 탭
+    pool = all_results if all_results else (tabs.get("전체") or [])
 
     if region_ranking:
         top = region_ranking[0]
@@ -1184,17 +1190,17 @@ def build_ticker_slides(tabs: dict) -> list:
             if second["total_growth"] / top["total_growth"] >= 0.90:
                 slides.append(f"⚡ {escape(top['region'])} vs {escape(second['region'])} 단 {diff}건 차이 초박빙!")
             else:
-                slides.append(f"🔥 이번 주 {escape(top['region'])}, {escape(second['region'])}을 {diff}건 차로 화제성 1위!")
+                slides.append(f"🔥 이번 주 {escape(top['region'])}, {escape(second['region'])}보다 {diff}건 차로 화제성 1위!")
 
-    if overall:
-        slides.append(f"🚀 이번 주 언급 급상승 1위 : {escape(overall[0]['name'])}")
+    if pool:
+        slides.append(f"🚀 이번 주 언급 급상승 1위 : {escape(pool[0]['name'])}")
 
-        genuines = [r for r in overall if r.get("genuine_ratio") is not None]
+        genuines = [r for r in pool if r.get("genuine_ratio") is not None]
         if genuines:  # 유효 지수 보유 식당이 없으면 이 슬라이드는 통째로 제외
             g = max(genuines, key=lambda r: r["genuine_ratio"])
             slides.append(f"💝 내돈내산 1위 : {escape(g['name'])} ({g['genuine_ratio']}%)")
 
-        steadies = [r for r in overall if r.get("streak", 0) >= STREAK_MIN_DAYS]
+        steadies = [r for r in pool if r.get("streak", 0) >= STREAK_MIN_DAYS]
         if steadies:  # 조건 매장이 없으면 이 슬라이드는 롤링에서 제외
             s = max(steadies, key=lambda r: r["streak"])
             slides.append(f"💎 {escape(s['region'])} 블로그스테디 매장 : {escape(s['name'])} ({s['streak']}일 연속)")
@@ -1202,7 +1208,7 @@ def build_ticker_slides(tabs: dict) -> list:
     return slides
 
 
-def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html"):
+def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html", all_results=None):
     """
     tabs 데이터를 실제 웹페이지(index.html) 하나로 만드는 함수.
     이 함수가 하는 일을 순서대로 요약하면:
@@ -1231,7 +1237,7 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     top_n = len(overall) if overall else TOP_N  # 헤더의 "TOP N" 숫자
 
     # --- 롤링 전광판(티커): 문구는 백엔드에서 완성, JS는 7초 순환만 담당 ---
-    ticker_slides = build_ticker_slides(tabs)
+    ticker_slides = build_ticker_slides(tabs, all_results)
     ticker_items_html = "".join(
         f'<div class="ticker-slide{" active" if i == 0 else ""}">{s}</div>'
         for i, s in enumerate(ticker_slides)
@@ -1792,31 +1798,47 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
   }}
 
   /* --- 롤링 전광판: 클릭/호버 무반응(pointer-events:none) 순수 자동 롤링.
+       전환 시 현재 문구는 위로 밀려 나가고 다음 문구가 아래에서 올라온다.
        이름이 아무리 길어도 한 줄로 말려 들어가 레이아웃이 안 깨진다 --- */
   .ticker {{
     max-width: 560px;
+    height: 37px;
     margin: 0 auto 12px;
     background: white;
     border-radius: 12px;
-    padding: 10px 14px;
+    padding: 0 14px;
     font-size: 12px;
     font-weight: 700;
     color: #555;
     box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-    white-space: nowrap;
     overflow: hidden;
-    text-overflow: ellipsis;
     pointer-events: none;
     box-sizing: border-box;
+    position: relative;
   }}
   .ticker-slide {{
-    display: none;
+    position: absolute;
+    left: 14px;
+    right: 14px;
+    top: 0;
+    line-height: 37px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    transform: translateY(100%);  /* 기본 대기 위치: 아래쪽 (보이지 않음) */
+    opacity: 0;
+    transition: transform 0.45s ease, opacity 0.45s ease;
   }}
   .ticker-slide.active {{
-    display: block;
+    transform: translateY(0);     /* 현재 표시 위치 */
+    opacity: 1;
+  }}
+  .ticker-slide.leaving {{
+    transform: translateY(-100%); /* 위로 밀려 나가는 위치 */
+    opacity: 0;
+  }}
+  .ticker-slide.no-transition {{
+    transition: none;             /* 대기 위치로 즉시 리셋할 때 사용 (JS) */
   }}
   body.dark .ticker {{
     background: #1e2129;
@@ -1875,7 +1897,7 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     border-color: #3a3f4a;
   }}
 
-  /* --- 카톡투표 항목 복사 버튼 (정렬 바 우측 끝) --- */
+  /* --- 현재 순위 매장 항목 복사 버튼 (정렬 바 우측 끝) --- */
   .vote-btn {{
     flex: 0 0 auto;
     margin-left: auto;
@@ -2441,7 +2463,7 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
       shareOrCopy(lines.join('\\n'), btn);
     }}
 
-    // ==================== 카톡투표 항목 복사 ====================
+    // ==================== 현재 순위 매장 항목 복사 ====================
     // 지금 화면 상태(카테고리 필터 + 정렬) 그대로, 보이는 상위 최대 5개의
     // "순수 이름"만 줄바꿈으로 이어 클립보드에 복사한다
     function copyVoteList(btn) {{
@@ -2456,15 +2478,26 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
 
     // ==================== 롤링 전광판 (순수 자동 순환) ====================
     // 슬라이드 문구는 백엔드가 미리 구워뒀고, 여기서는 7초마다 전환만 한다.
+    // 전환 애니메이션: 현재 문구(active)는 위로 밀려 나가고(leaving),
+    // 다음 문구는 아래 대기 위치에서 위로 올라온다(active).
     // 전광판 영역은 pointer-events:none이라 어떤 클릭/호버에도 반응하지 않는다.
     (function initTicker() {{
       var slides = document.querySelectorAll('.ticker-slide');
       if (slides.length < 2) return;  // 슬라이드가 1개뿐이면 순환 불필요
       var current = 0;
       window.advanceTicker = function() {{
-        slides[current].classList.remove('active');
+        var cur = slides[current];
+        var next = slides[(current + 1) % slides.length];
+        cur.classList.remove('active');
+        cur.classList.add('leaving');  // 현재 문구: 위로 퇴장
+        // 다음 문구: 예전에 퇴장했던 슬라이드일 수 있으므로, 전환 효과 없이
+        // 아래 대기 위치로 먼저 리셋한 뒤(강제 리플로우) 올라오는 애니메이션 시작
+        next.classList.add('no-transition');
+        next.classList.remove('leaving');
+        void next.offsetHeight;  // 리셋 위치를 브라우저에 즉시 반영시키는 트릭
+        next.classList.remove('no-transition');
+        next.classList.add('active');
         current = (current + 1) % slides.length;
-        slides[current].classList.add('active');
       }};
       setInterval(window.advanceTicker, 7000);
     }})();
@@ -2649,7 +2682,7 @@ if __name__ == "__main__":
     tabs = build_tabs(all_results, region_ranking)
 
     # 5) 위 데이터를 실제 웹페이지(index.html)로 만들어서 저장
-    render_html(tabs, total_filtered)
+    render_html(tabs, total_filtered, all_results=all_results)
 
     # 원본 데이터도 별도로 저장 (검증/디버깅용 - 나중에 "왜 이 순위가 나왔지?" 확인할 때 유용)
     with open("top8_raw.json", "w", encoding="utf-8") as f:
