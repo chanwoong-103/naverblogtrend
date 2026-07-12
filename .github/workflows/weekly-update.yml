@@ -60,31 +60,16 @@ jobs:
           NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
         run: python fetch_and_build.py
 
-      # "며칠 연속 급상승"을 계산하려면 어제 기록이 필요하므로,
-      # 방금 갱신된 streak_history.json을 저장소에 다시 커밋해둔다
-      - name: 연속 상승 기록(streak_history.json) 저장소에 저장
+      # "며칠 연속 급상승" 계산에는 어제 기록이, 지역 화제성 캐시(하루 1번만
+      # API 조회하고 나머지 실행은 재사용 - API 호출량 절약)에는 오늘 기록이
+      # 필요하므로, 방금 갱신된 두 기록 파일을 저장소에 다시 커밋해둔다
+      - name: 기록 파일(streak/지역캐시) 저장소에 저장
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add streak_history.json
-          git diff --cached --quiet || git commit -m "chore: streak_history.json 갱신 [skip ci]"
-
-          # 데이터 수집(최근 기준 약 15분)이 진행되는 동안 사람이 직접 main에
-          # 새 커밋을 올리면, 그 시점엔 이 워크플로우가 들고 있는 로컬 코드가
-          # 원격보다 뒤처진 상태라 그냥 push하면 "rejected (fetch first)"
-          # 에러로 실패한다. 그래서 push 직전에 원격의 최신 커밋을 rebase로
-          # 받아온 뒤 재시도한다 (최대 5번, 매번 5초 쉬었다가 재시도 - 그 사이에
-          # 또 새 커밋이 와도 결국엔 순서대로 반영되게 하기 위함).
-          for i in 1 2 3 4 5; do
-            if git push; then
-              echo "푸시 성공 (시도 $i/5)"
-              break
-            fi
-            echo "푸시 실패 (시도 $i/5) - 원격 변경사항을 받아와서 재시도합니다"
-            git fetch origin main
-            git rebase origin/main
-            sleep 5
-          done
+          git add streak_history.json region_volume_cache.json
+          git diff --cached --quiet || git commit -m "chore: 기록 파일 갱신 [skip ci]"
+          git push
 
       # index.html/robots.txt 외에, PWA(홈 화면 설치) 관련 정적 파일들도
       # 같이 배포 폴더에 담는다
@@ -92,7 +77,7 @@ jobs:
         run: |
           mkdir -p dist
           cp index.html dist/
-          cp robots.txt dist/
+          cp robots.txt sitemap.xml dist/
           cp icon.svg icon-192.png icon-512.png apple-touch-icon.png manifest.json sw.js dist/
 
       # 아래 두 단계는 GitHub Pages 배포를 위한 공식 준비 작업
