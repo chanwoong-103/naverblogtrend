@@ -425,6 +425,13 @@ def apply_streaks(results: list, today: datetime.date) -> None:
     이어서 셀 수 있게 한다. 로컬에서 매번 실행하면 파일이 계속 쌓이지만,
     GitHub Actions에서는 이 파일을 저장소에 다시 커밋해야 실행 사이에 기록이
     유지된다 (workflow 파일에 그 커밋 단계가 포함되어 있다).
+
+    주의: 이 스크립트는 하루에 여러 번(예: 2시간마다) 실행될 수 있다. "어제 기록이
+    있으면 +1, 없으면 1로 리셋" 이라는 단순한 규칙만 쓰면, 오늘 두 번째 실행부터는
+    "어제 기록"이 아니라 "오늘 아까 실행에서 남긴 기록"을 보게 되어 조건이 어긋나서
+    매번 1로 리셋돼버린다. 그래서 "오늘 이미 기록을 남긴 식당"인지를 먼저 확인해서,
+    같은 날 재실행 시에는 streak를 더 늘리지 않고 그대로 유지한다 (날짜가 실제로
+    넘어갔을 때만 +1). 하루에 몇 번을 돌리든 streak는 "며칠째 연속인지"만 센다.
     """
     history = {}
     if os.path.exists(STREAK_HISTORY_FILE):
@@ -444,7 +451,12 @@ def apply_streaks(results: list, today: datetime.date) -> None:
             continue  # 오늘 안 올랐으면 연속 기록 대상이 아님
 
         prev = history.get(name)
-        if prev and prev.get("last_date") == yesterday_str:
+        if prev and prev.get("last_date") == today_str:
+            # 오늘 이미 한 번 이상 실행되어 기록을 남긴 식당 - 같은 날 재실행이면
+            # 며칠 연속인지는 그대로 유지한다 (여기서 또 +1 하면 하루에 여러 번
+            # 돌릴 때마다 연속 일수가 부풀려짐)
+            streak = prev.get("streak", 1)
+        elif prev and prev.get("last_date") == yesterday_str:
             streak = prev.get("streak", 0) + 1  # 어제도 상승 중이었다 -> 연속 기록 이어감
         else:
             streak = 1  # 어제는 기록이 없거나 끊겼다 -> 오늘부터 새로 시작
