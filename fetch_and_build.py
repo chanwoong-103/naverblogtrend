@@ -1729,6 +1729,8 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
   .name {{
     font-size: 16px;
     font-weight: 700;
+    word-break: keep-all;       /* 한글 이름이 단어(어절) 단위로만 줄바꿈되게 */
+    overflow-wrap: anywhere;    /* 공백 없는 초장문 이름도 카드 밖으로 안 넘치게 */
   }}
   .region {{
     font-size: 12px;
@@ -1843,6 +1845,47 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
   .count {{
     font-size: 11px;
     color: #aaa;
+  }}
+
+  /* --- 모바일(좁은 화면) 전용: 카드 2단 배치 -------------------------------
+     기본 레이아웃(순위|이름|통계 3열 가로 배치)은 좁은 화면에서 통계 열과
+     공유/하트 버튼 예약 공간이 오른쪽을 고정으로 차지해, 이름이 쓸 수 있는
+     폭이 100px 안팎으로 줄어 긴 매장명("강릉원조누룽지 황금오징어순대..."류)이
+     2~3줄로 꺾이는 문제가 있었다. 그래서 520px 이하에서는:
+       1행 = 순위 + 이름/지역/배지 (화면 폭 전체 사용 -> 긴 이름도 한 줄)
+       2행 = 증가폭 + 연속/첫등장 배지 + 언급 건수 + 스파크라인 (오른쪽 정렬)
+     로 재배치한다. HTML 구조는 그대로 두고 flex-wrap만으로 처리하므로
+     JS(정렬/복사/월드컵의 .name 파싱 등)에는 아무 영향이 없다.
+     지역랭킹 탭 카드도 같은 클래스를 쓰므로 동일하게 정돈된다. --- */
+  @media (max-width: 520px) {{
+    .card {{
+      flex-wrap: wrap;
+      padding: 14px 16px 12px 16px;  /* 버튼용 오른쪽 66px 예약 해제 -> 폭 회수 */
+      gap: 0 12px;
+    }}
+    .info {{
+      flex: 1;
+      min-width: 0;
+      /* 이름 행만 우상단의 공유(🔗)/하트(♡) 절대배치 버튼을 피하면 되므로,
+         카드 전체가 아니라 info에만 오른쪽 여백을 준다 (2행은 폭 전부 사용) */
+      padding-right: 52px;
+    }}
+    .stats {{
+      flex-basis: 100%;             /* 다음 줄로 내려서 카드 폭 전체를 쓴다 */
+      flex-direction: row;          /* 세로 스택 -> 가로 한 줄 */
+      flex-wrap: wrap;              /* 배지가 많으면 자연스럽게 다음 줄로 */
+      align-items: center;
+      justify-content: flex-end;
+      gap: 4px 10px;
+      margin-top: 10px;
+      padding-top: 9px;
+      /* 반투명 회색이라 라이트/다크 양쪽 모드에서 별도 오버라이드 없이 동작 */
+      border-top: 1px solid rgba(125, 125, 125, 0.14);
+    }}
+    .growth {{
+      font-size: 15px;              /* 한 줄 배치에서 증가폭이 묻히지 않게 살짝 강조 */
+      margin-right: auto;           /* 증가폭만 왼쪽 끝, 나머지는 오른쪽 정렬 */
+    }}
   }}
 
   /* --- 다크모드 전환 버튼 (헤더 오른쪽 위 고정 - 지역 탭들과 분리된 독립 위치) --- */
