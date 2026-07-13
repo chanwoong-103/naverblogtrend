@@ -42,6 +42,7 @@ import time
 import datetime
 import re
 import urllib.request
+import sys
 import urllib.parse
 import urllib.error
 from html import unescape, escape
@@ -167,6 +168,27 @@ try:
         from config import HOT_REGION_COUNT
     except ImportError:
         HOT_REGION_COUNT = 3  # 후보 지역 중 화제성 상위 몇 개를 골라 추가할지
+    try:
+        from config import RISING_REGION_COUNT
+    except ImportError:
+        # 급상승 지역 전용 슬롯 수. 화제성 절대값 상위는 대형 상권이 상시 점유하기
+        # 쉬우므로, 전일 대비 신규 게시물 성장률 상위 지역을 별도로 선발한다.
+        RISING_REGION_COUNT = 0  # 0 = 기능 끔 (config에서 켜야 동작)
+    try:
+        from config import RISING_MIN_DAILY_POSTS
+    except ImportError:
+        RISING_MIN_DAILY_POSTS = 30  # 하루 신규 게시물 최소치 (소규모 노이즈 방지)
+    try:
+        from config import MINIFY_OUTPUT
+    except ImportError:
+        # 결과 HTML에서 통짜 주석 줄/들여쓰기를 벗겨 전송량 절감 (소스 주석은 유지)
+        MINIFY_OUTPUT = True
+    try:
+        from config import QUALITY_GUARD_MIN_RATIO
+    except ImportError:
+        # 품질 게이트: 수집 식당 수가 직전 실행의 이 비율 미만이면(급감 = API
+        # 부분 장애 신호) 배포를 중단하고 기존 페이지를 유지한다. 0 = 기능 끔.
+        QUALITY_GUARD_MIN_RATIO = 0.3
     try:
         from config import REGION_VOLUME_CACHE_FILE
     except ImportError:
@@ -466,6 +488,8 @@ def get_weekly_mention_counts(restaurant_name: str, today: datetime.date, region
     last_week_count = 0
     filtered_count = 0
     genuine_count = 0  # 협찬 필터를 통과한 글 중, "내돈내산" 계열 문구가 있었던 개수
+    oldest_seen = None       # 이번 조회에서 실제로 확인한 가장 오래된 게시일
+    reached_older_post = False  # 14일 창 밖(지난 주 이전)까지 도달했는지
 
     # start=1부터 100씩 늘려가며 페이지를 넘긴다 (네이버 API는 한 번에 최대 100건만 줌)
     start = 1
@@ -478,9 +502,9 @@ def get_weekly_mention_counts(restaurant_name: str, today: datetime.date, region
         })
         items = data.get("items", [])
         if not items:
-            break  # 더 이상 게시물이 없으면 종료
+            reached_older_post = True  # 게시물이 바닥남 = 창 전체를 다 본 것과 동일
+            break
 
-        reached_older_post = False
         for item in items:
             postdate_str = item.get("postdate", "")
             if not postdate_str or len(postdate_str) != 8:
@@ -498,6 +522,9 @@ def get_weekly_mention_counts(restaurant_name: str, today: datetime.date, region
 
             if post_date > today:
                 continue  # 혹시 미래 날짜로 잘못 찍힌 데이터 방어
+
+            if oldest_seen is None or post_date < oldest_seen:
+                oldest_seen = post_date
 
             title = item.get("title", "")
             description = item.get("description", "")
@@ -517,10 +544,33 @@ def get_weekly_mention_counts(restaurant_name: str, today: datetime.date, region
         # 오래된 글에 도달했거나(더 볼 필요 없음), 이 페이지가 100건 미만이었다면
         # (=마지막 페이지) 여기서 멈춘다. 그렇지 않으면 다음 100건을 더 가져온다.
         if reached_older_post or len(items) < 100:
+            if len(items) < 100:
+                reached_older_post = True  # 마지막 페이지 = 창 전체 확인 완료
             break
         start += 100
 
-    return this_week_count, last_week_count, filtered_count, genuine_count
+    # --- 수집 상한 검열(censoring) 처리 -----------------------------------------
+    # MAX_BLOG_RESULTS(예: 1000)를 다 소모하고도 14일 창 밖(지난 주 이전)까지
+    # 도달하지 못했다면, 창의 오래된 쪽(=지난 주)이 잘려나간 상태다.
+    # 최신순 정렬이라 잘리는 건 항상 지난 주 쪽이므로, 방치하면 last_week가
+    # 과소집계되어 growth가 과대평가된다 -> 초인기 매장일수록 순위가 부풀어
+    # 1위가 고착되는 왜곡 (예: 이번 주 1000 - 지난 주 0 = +1000처럼 보임).
+    #
+    # 보정: 실제로 확인한 지난 주 구간(oldest_seen ~ this_week_start-1)의
+    # 일평균 게시량으로 지난 주 7일 전체를 선형 추정한다. 추정치는 순위 계산에만
+    # 쓰이고, 화면 표기는 원시 집계 그대로 둔다 (사용자에게 알릴 필요 없는
+    # 내부 보정이므로 실행 로그의 ⚠️ 경고로만 남긴다).
+    capped = not reached_older_post
+    last_week_est = None
+    if capped and oldest_seen is not None and oldest_seen < this_week_start:
+        covered_days = (this_week_start - oldest_seen).days  # 확인된 지난 주 일수(1~7)
+        if covered_days >= 2 and last_week_count > 0:
+            last_week_est = round(last_week_count * 7 / covered_days)
+    # capped인데 oldest_seen이 이번 주 안이라면(=이번 주만으로 1000건 소진)
+    # 지난 주는 통째로 미확인 -> 추정 불가(None). 이 경우 growth 자체를
+    # 신뢰할 수 없으므로 호출부에서 보수적으로 다룬다.
+
+    return this_week_count, last_week_count, filtered_count, genuine_count, capped, last_week_est
 
 
 def get_genuine_ratio(this_week_count: int, last_week_count: int, genuine_count: int):
@@ -550,26 +600,55 @@ def get_region_volume(region: str):
         return None
 
 
+# 이번 실행에서 "급상승 슬롯"으로 선정된 지역들 (지역랭킹 화면의 🚀 배지 표시용).
+# resolve_active_regions()가 채워 넣는다.
+RISING_REGIONS = set()
+
+
 def resolve_active_regions() -> list:
     """
-    CORE_REGIONS(고정) + CANDIDATE_REGIONS 중 화제성 상위 HOT_REGION_COUNT개를 합쳐
-    이번 실행에서 실제로 쓸 지역 목록을 정한다.
+    이번 실행에서 실제로 쓸 지역 목록을 정한다:
+      CORE_REGIONS(고정)
+      + CANDIDATE_REGIONS 중 화제성 절대값 상위 HOT_REGION_COUNT개
+      + 전일 대비 신규 게시물 "성장률" 상위 RISING_REGION_COUNT개 (급상승 슬롯)
     CANDIDATE_REGIONS가 비어있으면(설정 안 했으면) 기존 REGIONS 방식 그대로 사용 (하위 호환).
+
+    급상승 슬롯 설계 메모: 화제성 값은 "{지역} 맛집"의 누적 총 게시물 수라서
+    전일 대비 '배율'은 의미가 없다 (누적치가 하루에 1.3배가 될 수 없음).
+    대신 (오늘 누적 - 어제 누적) = 하루 신규 게시물 수를 누적량으로 나눈
+    "일일 성장률"을 쓴다. 공주처럼 기반은 작아도 새 글이 폭증하는 지역이
+    강남처럼 기반이 큰 지역보다 높게 나오는 지표다.
     """
+    global RISING_REGIONS
+    RISING_REGIONS = set()
     if not CANDIDATE_REGIONS:
         return REGIONS
 
     # --- 하루 단위 캐시: 지역 화제성은 하루 안에 크게 변하지 않으므로,
     # 오늘(KST) 이미 조회한 기록이 있으면 API를 다시 부르지 않고 재사용한다.
     # (2시간마다 실행 기준, 후보 100개 지역이면 하루 약 1,100회 호출 절약)
+    #
+    # 전일 데이터 롤링: 날짜가 바뀐 첫 실행 시점에는 파일에 어제 값이 아직
+    # 남아 있으므로, 덮어쓰기 전에 prev_*로 옮겨 하루 더 보존한다.
+    # (급상승 슬롯의 전일 대비 계산에 사용 - 워크플로우의 커밋/복원 대상에
+    #  이미 이 파일이 있어서 추가 인프라 변경 없이 동작한다)
     today_str = kst_today().isoformat()
     cached_volumes = {}
+    prev_volumes = {}
+    prev_date = None
     if os.path.exists(REGION_VOLUME_CACHE_FILE):
         try:
             with open(REGION_VOLUME_CACHE_FILE, "r", encoding="utf-8") as f:
                 cache = json.load(f)
             if cache.get("date") == today_str:
+                # 오늘자 캐시: 그대로 재사용, 어제치는 이미 prev_*에 굴려져 있음
                 cached_volumes = cache.get("volumes", {})
+                prev_volumes = cache.get("prev_volumes", {})
+                prev_date = cache.get("prev_date")
+            else:
+                # 날짜가 바뀜: 파일에 남아 있는 "어제의 오늘치"를 prev로 승격
+                prev_volumes = cache.get("volumes", {})
+                prev_date = cache.get("date")
         except (json.JSONDecodeError, OSError):
             cached_volumes = {}  # 캐시가 깨져 있으면 그냥 새로 조회 (에러로 죽지 않게)
 
@@ -596,10 +675,15 @@ def resolve_active_regions() -> list:
                 volumes_to_save[region] = volume
         scored.append((region, volume))
 
-    # 오늘 날짜로 캐시 저장 (내일이 되면 date가 달라져서 자동으로 새로 조회됨)
+    # 오늘 날짜로 캐시 저장 + 어제치 보존 (내일이 되면 오늘치가 다시 prev로 굴러감)
     try:
         with open(REGION_VOLUME_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"date": today_str, "volumes": volumes_to_save}, f, ensure_ascii=False, indent=2)
+            json.dump({
+                "date": today_str,
+                "volumes": volumes_to_save,
+                "prev_date": prev_date,
+                "prev_volumes": prev_volumes,
+            }, f, ensure_ascii=False, indent=2)
     except OSError:
         pass  # 캐시 저장 실패는 치명적이지 않으므로 무시하고 계속 진행
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -609,7 +693,54 @@ def resolve_active_regions() -> list:
     for r in hot_picks:
         if r not in combined:
             combined.append(r)
-    print(f"[지역 확정] 고정 {CORE_REGIONS} + 화제성 상위 {hot_picks} = {combined}")
+
+    # --- 급상승 슬롯: 아직 선정 안 된 후보 중 일일 성장률 상위 ---
+    rising_picks = []
+    if RISING_REGION_COUNT > 0 and prev_volumes:
+        # 전일 캐시가 하루 이상 전일 수 있다 (Actions 중단으로 하루를 건너뛴 경우
+        # 델타가 48시간치로 부풀어짐) -> 경과 일수로 나눠 "일평균 신규"로 정규화
+        try:
+            gap_days = max(1, (kst_today() - datetime.date.fromisoformat(prev_date)).days)
+        except (TypeError, ValueError):
+            gap_days = 1
+        rising_scored = []
+        for region, volume in scored:
+            if region in combined:
+                continue  # 이미 고정/화제성 슬롯으로 선정된 지역은 제외
+            prev = prev_volumes.get(region)
+            if not prev or volume <= prev:
+                continue  # 전일 데이터 없음 or 신규 글 없음(검색 인덱스 요동 포함)
+            daily_new = (volume - prev) / gap_days
+            if daily_new < RISING_MIN_DAILY_POSTS:
+                continue  # 하루 신규 글이 너무 적으면 노이즈로 간주
+            ratio = daily_new / prev
+            if ratio >= 0.30:
+                # 누적 총량이 하루 만에 30% 이상 늘어나는 건 실제 유행이 아니라
+                # 검색 인덱스 리빌드/집계 요동일 가능성이 압도적 (진짜 바이럴이어도
+                # 누적치 기준 일 성장률은 보통 1% 미만). 오탐으로 지역 슬롯을
+                # 낭비하지 않도록 건너뛴다.
+                print(f"  - {region}: 일 성장률 {ratio*100:.0f}% - 인덱스 이상치로 판단, 제외")
+                continue
+            rising_scored.append((region, ratio, daily_new))
+        rising_scored.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        rising_picks = [r for r, _, _ in rising_scored[:RISING_REGION_COUNT]]
+        for r in rising_picks:
+            combined.append(r)
+        RISING_REGIONS = set(rising_picks)
+        if rising_picks:
+            detail = ", ".join(
+                f"{r}(+{d:.0f}건/일, {ratio*100:.2f}%/일)" for r, ratio, d in rising_scored[:RISING_REGION_COUNT]
+            )
+            print(f"[급상승 슬롯] {detail}" + (f" (전일 캐시 {gap_days}일 전 - 일평균 환산)" if gap_days > 1 else ""))
+        else:
+            print("[급상승 슬롯] 기준(하루 신규 "
+                  f"{RISING_MIN_DAILY_POSTS}건 이상) 충족 지역 없음")
+    elif RISING_REGION_COUNT > 0:
+        print("[급상승 슬롯] 전일 화제성 데이터 없음 - 내일부터 동작 (첫날은 건너뜀)")
+
+    print(f"[지역 확정] 고정 {CORE_REGIONS} + 화제성 상위 {hot_picks}"
+          + (f" + 급상승 {rising_picks}" if rising_picks else "")
+          + f" = {combined}")
     return combined
 
 
@@ -887,7 +1018,17 @@ def build_ranking() -> tuple:
 
     for region in REGIONS:
         print(f"[지역검색] {region} 맛집 후보 수집 중...")
-        candidates = get_candidate_restaurants(region, DISPLAY_PER_REGION)
+        # 급상승 슬롯 지역은 후보 풀을 2배로 심층 스캔한다: "지역이 뜨는 순간" =
+        # 신생 매장이 쏟아지는 순간이라, 로컬검색 상위 몇 개만 보면 새 매장을
+        # 놓치기 쉽다. 전 지역 확대는 API 낭비이므로 필요한 지역에만 집중 투자.
+        # (급상승 여부는 그날 첫 실행에서 확정되고 후보 캐시도 같은 날짜 기준으로
+        #  초기화되므로, 하루 안에서 캐시와 스캔 깊이가 어긋날 일은 없다)
+        _deep = region in RISING_REGIONS
+        candidates = get_candidate_restaurants(
+            region, DISPLAY_PER_REGION * (2 if _deep else 1)
+        )
+        if _deep:
+            print(f"    (급상승 지역 심층 스캔: 후보 {len(candidates)}개 수집)")
 
         for candidate in candidates:
             name = candidate["name"]
@@ -904,14 +1045,36 @@ def build_ranking() -> tuple:
             # 빌드 전체(그리고 그 회차에 이미 쓴 수백 건의 API 호출)가 통째로
             # 죽지 않도록, 해당 식당만 이번 실행에서 건너뛰고 계속 진행한다.
             try:
-                this_week, last_week, filtered, genuine = get_weekly_mention_counts(name, today, region)
+                this_week, last_week, filtered, genuine, capped, last_week_est = \
+                    get_weekly_mention_counts(name, today, region)
             except Exception as e:
                 print(f"    ({name}: 언급 수 집계 실패, 이번 실행에서 건너뜀: {e})")
                 continue
             total_filtered += filtered
             if filtered:
                 print(f"    (협찬/광고 추정 {filtered}건 제외)")
+
             growth = this_week - last_week  # 이게 바로 "급상승" 순위를 매기는 핵심 숫자
+
+            # --- 수집 상한 검열 보정: MAX_BLOG_RESULTS를 다 쓰고도 14일 창을 다
+            # 못 본 경우, 지난 주가 잘려나가 growth가 부풀어 있다. 순위 계산에는
+            # 확인된 구간의 일평균으로 추정한 지난 주(last_week_est)를 쓰고,
+            # 화면 표기는 원시 집계 그대로 둔다 (로그 경고로만 확인).
+            growth_for_score = growth
+            if capped:
+                if last_week_est is not None:
+                    growth_for_score = this_week - last_week_est
+                    print(f"    ⚠️ {name}: 수집 상한({MAX_BLOG_RESULTS}건) 도달 - "
+                          f"지난 주 {last_week}건(부분)을 {last_week_est}건으로 추정해 "
+                          f"순위 반영 (growth {growth} -> {growth_for_score})")
+                else:
+                    # 이번 주만으로 상한을 소진해 지난 주를 한 건도 못 봄:
+                    # 증가폭 추정 근거가 없으므로 보수적으로 0으로 처리
+                    # (전체/급상승 표시에서는 빠지고, 지역 통계·지역 탭에는 남는다)
+                    growth_for_score = 0
+                    print(f"    ⚠️ {name}: 수집 상한 도달 + 지난 주 데이터 전무 - "
+                          f"급상승 판정 보류 (지역 통계에는 포함)")
+
             genuine_ratio = get_genuine_ratio(this_week, last_week, genuine)
 
             # 최소 언급량 필터: 우연히 1~2건 튄 걸 급상승으로 착시하지 않도록
@@ -962,7 +1125,9 @@ def build_ranking() -> tuple:
             # 지수 5%면 -0.5가 되어, growth -2에 지수 50%인 매장의 -1.0을 이김).
             # 음수/0은 growth 그대로 써서 하락 폭 순서가 정직하게 유지되게 한다.
             # (지역랭킹 합산과 티커의 침체 판정은 score가 아니라 growth를 쓰므로 영향 없음)
-            score = growth * smoothed_ratio if growth > 0 else growth
+            # 수집 상한(capped) 보정: 순위 점수는 검열 보정된 growth_for_score 기준.
+            # 화면의 +N 배지/건수는 원시 집계 그대로 (보정은 내부에서만, 로그로 확인).
+            score = growth_for_score * smoothed_ratio if growth_for_score > 0 else growth_for_score
 
             results.append({
                 "name": name,
@@ -974,6 +1139,7 @@ def build_ranking() -> tuple:
                 "filtered": filtered,
                 "genuine_ratio": genuine_ratio,  # None이면 표본 부족 -> 화면에 배지 안 뜸
                 "low_genuine": low_genuine,  # True면 표시 단계(탭/티커)에서만 제외
+                "capped": capped,  # True면 수집 상한 도달 (건수는 하한값, 카드에 칩 표시)
                 "score": score,
             })
             ratio_note = f", 내돈내산 {genuine_ratio}%" if genuine_ratio is not None else ""
@@ -1019,6 +1185,11 @@ def build_region_ranking(all_results: list) -> list:
         agg[region]["total_last_week"] += r["last_week"]
         agg[region]["count"] += 1
     ranking = list(agg.values())
+    # 급상승 슬롯으로 선정된 지역 표시 (지역랭킹 카드의 🚀 배지용).
+    # 선정 근거(전일 대비 성장률)는 resolve_active_regions()가 계산했고,
+    # 여기서는 그 결과 집합(RISING_REGIONS)만 플래그로 옮겨 단다.
+    for row in ranking:
+        row["is_rising"] = row["region"] in RISING_REGIONS
     ranking.sort(key=lambda x: x["total_growth"], reverse=True)  # 증가폭 합계 큰 지역이 위로
     return ranking
 
@@ -1054,17 +1225,38 @@ def build_tabs(all_results: list, region_ranking: list) -> dict:
         if len(overall) == TOP_N:
             break
     tabs = {"전체": overall}  # 첫 번째 탭은 항상 "전체" (전 지역 통합 TOP N)
+    # "협찬 포함" 토글용 추가 카드: low_genuine(내돈내산 지수 미달) 상승 매장도
+    # 카드로 미리 구워서 리스트 뒤에 붙여두되, 기본은 숨김(lg-hidden 클래스).
+    # 화면의 토글 버튼이 켜지면 JS가 보여주고 현재 정렬 기준으로 재배열한다.
+    # (서버 재호출 없이 표시 모드만 바꾸는 방식 - 클라이언트 사이드 원칙 유지)
+    lg_overall = []
+    seen_lg = set()
+    for r in all_results:
+        if r["growth"] <= 0 or not r.get("low_genuine"):
+            continue
+        if r["name"] in seen_global or r["name"] in seen_lg:
+            continue
+        seen_lg.add(r["name"])
+        lg_overall.append(r)
+        if len(lg_overall) == TOP_N:
+            break
+    tabs["전체"] = overall + lg_overall
     if region_ranking:
         tabs["지역랭킹"] = region_ranking  # 두 번째 탭 = 지역별 랭킹 (데이터 있을 때만)
     for region in REGIONS:
-        # low_genuine(내돈내산 지수 미달) 매장은 지역별 탭 화면에서도 제외한다.
-        # (지역랭킹 탭의 합산 통계에는 이미 build_region_ranking()에서 포함됨)
-        region_results = [
+        # 기본 표시분(내돈내산 지수 충족) 상위 N개 + 협찬 포함 모드용 숨김분 상위 N개.
+        # 숨김분도 all_results 정렬 순서(점수순)를 그대로 물려받는다.
+        clean = [
             r for r in all_results
             if r["region"] == region and not r.get("low_genuine")
         ]
-        if region_results:  # 데이터가 있는 지역만 탭으로 생성 (빈 탭 방지)
-            tabs[region] = region_results[:TOP_N_PER_REGION]
+        lg = [
+            r for r in all_results
+            if r["region"] == region and r.get("low_genuine")
+        ]
+        region_items = clean[:TOP_N_PER_REGION] + lg[:TOP_N_PER_REGION]
+        if region_items:  # 데이터가 있는 지역만 탭으로 생성 (빈 탭 방지)
+            tabs[region] = region_items
     return tabs
 
 
@@ -1114,19 +1306,30 @@ def render_region_cards(ranking: list) -> str:
         growth_badge = f"+{r['total_growth']}" if r["total_growth"] > 0 else str(r["total_growth"])
         region_map_query = urllib.parse.quote(r["region"] + " 맛집")
         map_url = f"https://map.naver.com/p/search/{region_map_query}"
+        # 급상승 슬롯으로 선정된 지역 구분 배지: 화제성 절대값(볼륨 상위)이 아니라
+        # "전일 대비 신규 게시물 성장률"로 뽑혀 들어온 지역임을 표시한다
+        rising_badge_html = (
+            ' <span class="rising-badge">🚀 급상승 지역</span>'
+            if r.get("is_rising") else ""
+        )
         rows_html += f"""
         <a class="card" data-mapquery="{region_map_query}" href="{map_url}" target="_blank" rel="noopener">
           <div class="rank">{i}</div>
           <div class="info">
             <div class="name">{escape(r['region'])} <span class="map-icon">📍</span></div>
-            <div class="region">언급 식당 {r['count']}곳</div>
+            <div class="region">언급 식당 {r['count']}곳{rising_badge_html}</div>
           </div>
           <div class="stats">
             <span class="growth">{growth_badge}</span>
             <span class="count">이번 주 {r['total_this_week']}건 · 지난 주 {r['total_last_week']}건</span>
           </div>
         </a>"""
-    return rows_html
+    # 카드 사이 간격(gap: 10px)은 .card 자체가 아니라 .card-list 래퍼가 담당한다.
+    # 예전에는 이 래퍼 없이 카드 <a>들만 반환해서 지역랭킹 탭만 카드가 0px로
+    # 붙어 그림자/모서리가 겹쳐 보였다 (특히 모바일 2단 배치에서 도드라짐).
+    # render_cards()와 동일하게 감싸서 간격을 통일한다. 정렬/필터 JS는 전부
+    # 버튼이 속한 패널 스코프로만 동작하고 이 탭에는 그 버튼이 없으므로 안전.
+    return f'<div class="card-list">{rows_html}</div>'
 
 
 def render_cards(items: list) -> str:
@@ -1165,8 +1368,15 @@ def render_cards(items: list) -> str:
         # 상위 5개 이름만 줄바꿈으로 복사. 예전엔 정렬 바 우측 끝에 인라인으로 붙어
         # 있어서 정렬 버튼으로 오인 클릭되기 쉬웠는데, 카드 리스트 직전의 독립된
         # 한 줄(utility-row)로 분리해 와이드하게 단독 배치한다.
+        # 유틸리티 줄: 카드 리스트 직전의 독립된 한 줄. 예전엔 "순위 복사" 버튼
+        # 하나만 와이드로 있었는데, 지역 탭 줄 맨 끝에 숨어 있어 잘 안 보이던
+        # "즐겨찾기"를 이리로 옮기고, 협찬성 매장까지 보여주는 표시 모드 토글
+        # ("협찬 포함")을 추가해 3버튼 구성으로 바꿨다.
         '<div class="utility-row">'
-        '<button class="vote-btn" onclick="copyVoteList(this)">📊 현재 순위 매장 항목 복사</button>'
+        '<button class="util-btn vote-btn" onclick="copyVoteList(this)">📊 순위 복사</button>'
+        '<button class="util-btn" onclick="openFavoritesTab()">♥ 즐겨찾기</button>'
+        '<button class="util-btn lg-toggle-btn" onclick="toggleSponsored(this)" '
+        'title="내돈내산 지수 미달로 숨겨진 매장까지 표시">⚠️ 협찬 포함</button>'
         '</div>'
     )
 
@@ -1254,8 +1464,21 @@ def render_cards(items: list) -> str:
         safe_name = escape(r["name"])
         safe_region = escape(r["region"])
 
+        # 협찬 포함 모드용 표시: low_genuine 매장 카드는 기본 숨김(lg-hidden)으로
+        # 렌더링하고, 구분용 경고 배지를 단다. 화면의 "협찬 포함" 토글이 켜지면
+        # JS가 lg-hidden만 벗겨서 보여준다 (내돈내산 % 배지는 그대로 함께 표시됨).
+        lg_class = " lg-card lg-hidden" if r.get("low_genuine") else ""
+        lg_badge_html = (
+            ' <span class="lg-badge">⚠️ 협찬성 높음</span>'
+            if r.get("low_genuine") else ""
+        )
+        # 참고: 수집 상한(capped) 도달은 화면에 표시하지 않는다 - 순위는 이미
+        # 빌드 단계에서 보정됐고, 사용자가 알 필요 없는 내부 사정이라서.
+        # 확인이 필요하면 Actions 실행 로그의 ⚠️ 경고나 top8_raw.json의
+        # capped 필드를 보면 된다.
+
         rows_html += f"""
-        <a class="card" data-category="{escape(category)}" data-rankmetric="{rank_metric_value}"
+        <a class="card{lg_class}" data-category="{escape(category)}" data-rankmetric="{rank_metric_value}"
            data-thisweek="{r['this_week']}" data-genuine="{genuine_for_sort}"
            data-rate="{rate_value}" data-region="{safe_region}"
            data-mapquery="{map_query}"
@@ -1267,7 +1490,7 @@ def render_cards(items: list) -> str:
           <div class="rank"><span class="rank-num">{i}</span>{delta_html}</div>
           <div class="info">
             <div class="name">{safe_name} <span class="map-icon">📍</span></div>
-            <div class="region">{safe_region} · {category} {genuine_badge_html}</div>
+            <div class="region">{safe_region} · {category} {genuine_badge_html}{lg_badge_html}</div>
             {search_badge_html}
           </div>
           <div class="stats">
@@ -1372,6 +1595,57 @@ def build_ticker_slides(tabs: dict, all_results=None) -> list:
     return slides
 
 
+def _slim_html(html: str) -> str:
+    """
+    결과 HTML에서 "통짜 주석 줄"과 들여쓰기, 빈 줄만 벗겨 전송량을 줄인다
+    (실측: gzip 기준 약 30% 절감). 소스 코드의 주석은 그대로 유지된다.
+
+    안전성 원칙: 정규식 기반 압축기는 JS 문자열 속 '//'(URL 등)를 오인해
+    코드를 깨뜨릴 수 있으므로, 여기서는 "줄 전체가 주석인 경우"만 라인 단위로
+    제거한다. 코드와 주석이 한 줄에 섞인 경우(트레일링 주석)는 건드리지 않고
+    그대로 둔다 - 몇 바이트 아끼자고 코드가 깨질 위험을 지지 않는다.
+    처리 대상: JS의 // 줄, CSS/JS의 /* ... */ 줄(여러 줄 블록 포함),
+    HTML의 <!-- ... --> 줄(여러 줄 블록 포함), 줄 앞 들여쓰기, 빈 줄.
+    """
+    kept = []
+    in_css_block = False   # /* ... */ 여러 줄 블록 안인지
+    in_html_block = False  # <!-- ... --> 여러 줄 블록 안인지
+    for line in html.split("\n"):
+        s = line.strip()
+        if in_css_block:
+            if s.endswith("*/"):
+                in_css_block = False
+            elif "*/" in s:
+                # 블록이 끝나면서 같은 줄에 코드가 이어지는 특이 케이스:
+                # 판단하지 않고 통째로 보존 (이 템플릿에는 없는 패턴이지만 방어)
+                in_css_block = False
+                kept.append(s)
+            continue
+        if in_html_block:
+            if s.endswith("-->"):
+                in_html_block = False
+            elif "-->" in s:
+                in_html_block = False
+                kept.append(s)
+            continue
+        if not s:
+            continue  # 빈 줄 제거
+        if s.startswith("//"):
+            continue  # JS 한 줄 주석 (줄 전체가 주석일 때만)
+        if s.startswith("/*"):
+            if s.endswith("*/"):
+                continue  # 한 줄짜리 /* */ 주석
+            in_css_block = True
+            continue
+        if s.startswith("<!--"):
+            if s.endswith("-->"):
+                continue  # 한 줄짜리 HTML 주석
+            in_html_block = True
+            continue
+        kept.append(s)  # 들여쓰기 제거된 형태로 보존
+    return "\n".join(kept)
+
+
 def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html", all_results=None):
     """
     tabs 데이터를 실제 웹페이지(index.html) 하나로 만드는 함수.
@@ -1401,7 +1675,23 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
         f'<span class="hero-badge-secondary">{badge}</span>' for badge in EXTRA_BADGES
     )
     overall = tabs.get("전체", [])
-    top_n = len(overall) if overall else TOP_N  # 헤더의 "TOP N" 숫자
+    # 주의: overall에는 "협찬 포함" 토글용 숨김(lg) 카드가 뒤에 붙어 있다.
+    # 제목/헤더의 "TOP N"이 숨김 카드까지 세면 "TOP 16"처럼 부풀어 보이므로
+    # 기본 화면에 실제로 표시되는 분량만 센다.
+    visible_overall = [r for r in overall if not r.get("low_genuine")]
+    top_n = len(visible_overall) if visible_overall else TOP_N  # 헤더의 "TOP N" 숫자
+
+    # --- 공유 미리보기(OG) 문구 동적화: 빌드 시점의 급상승 1위를 박아 넣어
+    # 카톡/문자 링크 미리보기가 "살아있는 정보"가 되게 한다 (2시간마다 갱신되는
+    # 정적 페이지의 장점을 공유 카드에도 반영) ---
+    if visible_overall:
+        _top1 = visible_overall[0]
+        og_description = escape(
+            f"이번 주 급상승 1위: {_top1['name']} ({_top1['region']}) "
+            f"+{_top1['growth']}건 · 2시간마다 자동 갱신"
+        )
+    else:
+        og_description = f"네이버 블로그 언급량 기준, 이번 주 가장 뜨는 맛집 TOP {top_n}을 확인해보세요."
 
     # --- 롤링 전광판(티커): 문구는 백엔드에서 완성, JS는 7초 순환만 담당 ---
     ticker_slides = build_ticker_slides(tabs, all_results)
@@ -1464,7 +1754,9 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     # 여기서는 빈 틀만 만들어두고, 실제 내용은 페이지가 열릴 때 JS가 채워 넣는다
     # (renderFavoritesTab 함수가 담당 - 다른 탭에 이미 그려진 카드들 중
     # 즐겨찾기 표시된 것만 모아서 이 탭 안에 복사해 넣는 방식)
-    tab_buttons_html += '<button class="tab-btn" data-tab="tab-favorites">♥ 즐겨찾기</button>'
+    # 참고: 예전엔 지역 탭 줄 맨 끝에 "♥ 즐겨찾기" 탭 버튼이 있었는데, 지역이
+    # 많아지면서 가로 스크롤 끝에 숨어 잘 안 보여서 유틸리티 줄의 버튼
+    # (openFavoritesTab)으로 이동했다. 패널 자체는 그대로 유지된다.
     tab_panels_html += (
         '<div class="tab-panel" id="tab-favorites" data-tabname="즐겨찾기">'
         '<p style="text-align:center;color:#999;padding:20px 0;">'
@@ -1483,10 +1775,11 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>이번 주 블로그 언급 급상승 맛집 TOP {top_n}</title>
 
-<!-- 카톡/문자로 링크 공유 시 미리보기 카드에 쓰이는 정보 -->
-<meta name="description" content="네이버 블로그 언급량 기준, 이번 주 가장 뜨는 맛집 TOP {top_n}을 확인해보세요.">
+<!-- 카톡/문자로 링크 공유 시 미리보기 카드에 쓰이는 정보 (문구는 빌드마다
+     이번 주 급상승 1위로 갱신됨 - render_html의 og_description 참고) -->
+<meta name="description" content="{og_description}">
 <meta property="og:title" content="이번 주 블로그 언급 급상승 맛집 TOP {top_n}">
-<meta property="og:description" content="네이버 블로그 언급량 기준, 이번 주 가장 뜨는 맛집 TOP {top_n}을 확인해보세요.">
+<meta property="og:description" content="{og_description}">
 <meta property="og:image" content="{OG_IMAGE_URL}">
 <meta property="og:type" content="website">
 
@@ -1521,8 +1814,13 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
     background: #f5f5f7;
     margin: 0;
-    padding: 24px 16px 64px;
+    /* env(safe-area-inset-bottom): 아이폰 하단 홈 인디케이터 영역만큼 여백 추가
+       (지원 안 하는 브라우저에선 0px로 계산되어 기존과 동일) */
+    padding: 24px 16px calc(64px + env(safe-area-inset-bottom, 0px));
     color: #1a1a1a;
+    /* 모바일에서 탭/카드 터치 시 나오는 반투명 회색 깜빡임 제거
+       (active/hover 스타일이 따로 있어서 피드백은 유지됨) */
+    -webkit-tap-highlight-color: transparent;
   }}
   .hero {{
     max-width: 560px;
@@ -1607,6 +1905,28 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     gap: 6px;
     overflow-x: auto;
     padding-bottom: 4px;
+    /* 스크롤해도 지역 탭이 화면 상단에 붙어 있게 (모바일에서 리스트를 깊이
+       내려간 뒤 다른 지역으로 이동할 때 맨 위까지 되돌아갈 필요 없어짐).
+       배경색을 페이지와 같게 깔아서 카드가 탭 뒤로 지나갈 때 비치지 않게 한다. */
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: #f5f5f7;
+    padding-top: 8px;
+    transition: background 0.25s;
+  }}
+  body.dark .tabs {{
+    background: #14161b;
+  }}
+  /* 가로 스크롤 칩 바(지역 탭/카테고리/정렬)의 스크롤바 숨김 - 스크롤 기능은
+     그대로 유지되고, 안드로이드 크롬 등에서 보이던 가는 회색 바만 사라진다 */
+  .tabs, .cat-filter, .sort-bar {{
+    scrollbar-width: none;      /* Firefox */
+  }}
+  .tabs::-webkit-scrollbar,
+  .cat-filter::-webkit-scrollbar,
+  .sort-bar::-webkit-scrollbar {{
+    display: none;              /* Chrome/Safari */
   }}
   .tab-btn {{
     flex: 0 0 auto;
@@ -1900,6 +2220,23 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     .growth {{
       font-size: 15px;              /* 한 줄 배치에서 증가폭이 묻히지 않게 살짝 강조 */
       margin-right: auto;           /* 증가폭만 왼쪽 끝, 나머지는 오른쪽 정렬 */
+    }}
+    /* 하트/공유 버튼 터치 영역 확대: 기존 22x22px는 모바일 권장 크기의 절반이라
+       옆의 카드 링크(네이버 지도)가 대신 눌리는 오터치가 잦았다. 아이콘 크기와
+       중심점은 그대로 두고 투명한 히트 영역만 32x32px로 키운다.
+       (공유 버튼 왼쪽 끝 = 오른쪽에서 33+32=65px <- .info의 padding-right
+        52px + .card의 padding 16px = 68px 여유 안쪽이라 매장명과 안 겹침) */
+    .fav-btn {{
+      width: 32px;
+      height: 32px;
+      top: 5px;                     /* 기존 중심(top10+11=21px) 유지: 5+16=21 */
+      right: 5px;                   /* 기존 중심(right10+11=21px) 유지 */
+    }}
+    .share-btn {{
+      width: 32px;
+      height: 32px;
+      top: 5px;
+      right: 33px;                  /* 기존 중심(right38+11=49px) 유지: 33+16=49 */
     }}
   }}
 
@@ -2205,24 +2542,71 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
      정렬 바 안에 인라인으로 붙어 있으면 정렬 버튼으로 오인 클릭되기 쉬워서,
      정렬 바와 카드 리스트 사이의 독립된 한 줄(utility-row)에 와이드로 단독 배치 */
   .utility-row {{
+    display: flex;
+    gap: 8px;
     margin-bottom: 10px;
   }}
-  .vote-btn {{
-    display: block;
-    width: 100%;
+  .util-btn {{
+    flex: 1;
+    min-width: 0;
     border: 1px dashed #ddd;
     background: white;
     color: #666;
     font-size: 12px;
     font-weight: 700;
-    padding: 9px 14px;
+    padding: 9px 4px;
     border-radius: 12px;
     cursor: pointer;
+    white-space: nowrap;
   }}
-  body.dark .vote-btn {{
+  body.dark .util-btn {{
     background: #1e2129;
     border-color: #2a2e38;
     color: #9aa0ab;
+  }}
+  /* "협찬 포함" 토글이 켜진 상태 표시 */
+  .lg-toggle-btn.active {{
+    border-style: solid;
+    border-color: #ff5a36;
+    background: #fff0eb;
+    color: #ff5a36;
+  }}
+  body.dark .lg-toggle-btn.active {{
+    background: #32201a;
+    border-color: #ff5a36;
+    color: #ff8a66;
+  }}
+  /* 협찬성 매장 카드: 기본 숨김. "협찬 포함" 토글이 켜지면 JS가
+     lg-hidden 클래스를 벗겨서 보여준다 (cat-hidden과는 독립적으로 동작) */
+  .card.lg-hidden {{
+    display: none;
+  }}
+  .lg-badge {{
+    font-size: 10px;
+    font-weight: 700;
+    color: #8a6d3b;
+    background: #f7ecd8;
+    padding: 2px 7px;
+    border-radius: 999px;
+    display: inline-block;
+  }}
+  body.dark .lg-badge {{
+    background: #3a3020;
+    color: #d9b36a;
+  }}
+  /* 지역랭킹 탭: 급상승 슬롯(전일 대비 성장률)으로 선정된 지역 구분 배지 */
+  .rising-badge {{
+    font-size: 10px;
+    font-weight: 700;
+    color: #ff5a36;
+    background: #fff0eb;
+    padding: 2px 7px;
+    border-radius: 999px;
+    display: inline-block;
+  }}
+  body.dark .rising-badge {{
+    background: #32201a;
+    color: #ff8a66;
   }}
 
   /* --- 즐겨찾기 목록 통째로 공유 버튼 --- */
@@ -2297,6 +2681,20 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     margin: 10px 0 22px;
     word-break: keep-all;
   }}
+  /* 결과 모달의 지역 · 카테고리 서브라인 (랜덤 추천/월드컵 우승 공용).
+     이름의 margin-bottom(22px)과 여기의 -16px가 마진 상쇄로 합쳐져
+     이름-서브라인 간격은 6px, 서브라인-버튼 간격은 22px이 된다.
+     메타 정보가 없는 카드면 JS가 display:none으로 숨기는데, 그 경우
+     이름의 22px 마진이 그대로 살아나 기존 레이아웃과 동일해진다. */
+  .pick-modal-sub {{
+    font-size: 13px;
+    color: #999;
+    font-weight: 700;
+    margin: -16px 0 22px;
+  }}
+  body.dark .pick-modal-sub {{
+    color: #8a8f99;
+  }}
   .pick-modal-buttons {{
     display: flex;
     gap: 8px;
@@ -2370,6 +2768,7 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     <div class="pick-modal-box">
       <div class="pick-modal-label">오늘 당신의 픽은</div>
       <div class="pick-modal-name" id="pick-modal-name">-</div>
+      <div class="pick-modal-sub" id="pick-modal-sub"></div>
       <div class="pick-modal-buttons">
         <a id="pick-modal-map" href="#" target="_blank" rel="noopener" class="pick-modal-map-btn">지도에서 보기</a>
         <button class="pick-modal-close-btn" onclick="sharePick(this)">🎰 공유</button>
@@ -2389,6 +2788,7 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
       </div>
       <div id="wc-winner" style="display:none;">
         <div class="pick-modal-name" id="wc-winner-name">-</div>
+        <div class="pick-modal-sub" id="wc-winner-sub"></div>
         <div class="pick-modal-buttons">
           <a id="wc-winner-map" href="#" target="_blank" rel="noopener" class="pick-modal-map-btn">지도에서 보기</a>
           <button class="pick-modal-close-btn" onclick="shareWcWinner(this)">🏆 공유</button>
@@ -2437,6 +2837,14 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
         document.querySelectorAll('.tab-panel').forEach(function(p) {{ p.classList.remove('active'); }});
         btn.classList.add('active');
         document.getElementById(btn.dataset.tab).classList.add('active');
+        // 리스트를 깊이 스크롤한 상태에서 탭을 바꾸면 새 탭의 중간 지점부터
+        // 보이는 문제가 있었다 (탭바가 sticky라 화면 위쪽에 떠 있는 상태).
+        // 탭 위치보다 아래로 내려가 있을 때만 탭바 바로 위로 스크롤을 되돌린다.
+        // (탭이 원래 위치에 그대로 보이는 상태에서는 아무것도 하지 않음)
+        var tabsEl = document.querySelector('.tabs');
+        if (tabsEl && window.scrollY > tabsEl.offsetTop) {{
+          window.scrollTo(0, tabsEl.offsetTop);
+        }}
       }});
     }});
 
@@ -2445,7 +2853,7 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     // (지금 화면에 실제로 보이는) 카드만 대상으로 무작위 하나를 고른다.
     function runRandomPick(btn) {{
       var panel = btn.closest('.tab-panel');
-      var cards = Array.prototype.slice.call(panel.querySelectorAll('.card:not(.cat-hidden)'));
+      var cards = Array.prototype.slice.call(panel.querySelectorAll('.card:not(.cat-hidden):not(.lg-hidden)'));
       if (cards.length === 0) return;
 
       btn.disabled = true;  // 애니메이션 도는 동안 중복 클릭 방지
@@ -2481,6 +2889,16 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
       modal.dataset.map = card.href;
       modal.dataset.tab = (panel && panel.dataset.tabname) || '';
       document.getElementById('pick-modal-name').textContent = name;
+      // 지역 · 카테고리 서브라인: 카드에 이미 심어둔 data 속성에서 읽으므로
+      // 추가 연산/통신 없음 (월드컵 대진 버튼의 메타 표기와 같은 형식)
+      var pickRegion = card.dataset.region || '';
+      var pickCategory = card.dataset.category || '';
+      var pickMeta = pickRegion
+        ? pickRegion + (pickCategory ? ' · ' + pickCategory : '')
+        : pickCategory;
+      var pickSub = document.getElementById('pick-modal-sub');
+      pickSub.textContent = pickMeta;
+      pickSub.style.display = pickMeta ? '' : 'none';
       document.getElementById('pick-modal-map').href = card.href;
       modal.classList.add('active');
     }}
@@ -2495,7 +2913,7 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     // 정렬/필터를 적용할 때마다 이 함수를 호출해서, 지금 실제로 보이는 순서 그대로
     // 1번부터 다시 매겨준다 (공유 버튼이 계산하는 순위와도 항상 일치하게 됨).
     function renumberVisibleRanks(panel) {{
-      var visible = Array.prototype.slice.call(panel.querySelectorAll('.card-list .card:not(.cat-hidden)'));
+      var visible = Array.prototype.slice.call(panel.querySelectorAll('.card-list .card:not(.cat-hidden):not(.lg-hidden)'));
       visible.forEach(function(card, idx) {{
         // .rank 전체의 textContent를 덮어쓰면 안에 있는 순위변동 화살표(▲▼)까지
         // 지워지므로, 숫자만 담고 있는 .rank-num 부분만 갱신한다
@@ -2571,7 +2989,7 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
 
       // 지금 화면에 실제로 보이는(카테고리 필터로 숨겨지지 않은) 카드들 중 몇 번째인지 계산
       var visibleCards = panel
-        ? Array.prototype.slice.call(panel.querySelectorAll('.card:not(.cat-hidden)'))
+        ? Array.prototype.slice.call(panel.querySelectorAll('.card:not(.cat-hidden):not(.lg-hidden)'))
         : [card];
       var rank = visibleCards.indexOf(card) + 1;
       if (rank <= 0) rank = 1;
@@ -2674,6 +3092,12 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
           var cloneFavBtn = clone.querySelector('.fav-btn');
           cloneFavBtn.textContent = '♥';
           cloneFavBtn.classList.add('active');
+          // 협찬성(lg) 카드를 협찬 포함 모드에서 즐겨찾기했다면, 유저가 직접
+          // 고른 것이므로 토글 상태와 무관하게 즐겨찾기 탭에서는 항상 보여준다.
+          // lg-card 클래스까지 벗겨야 토글 OFF 시 applySponsoredMode가 이 복제본을
+          // 다시 숨기지 못한다 (경고 배지는 innerHTML에 있어 그대로 유지됨).
+          clone.classList.remove('lg-hidden');
+          clone.classList.remove('lg-card');
           cardsHtml += clone.outerHTML;
         }}
       }});
@@ -2824,7 +3248,7 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     // "순수 이름"만 줄바꿈으로 이어 클립보드에 복사한다
     function copyVoteList(btn) {{
       var panel = btn.closest('.tab-panel');
-      var visible = Array.prototype.slice.call(panel.querySelectorAll('.card-list .card:not(.cat-hidden)'));
+      var visible = Array.prototype.slice.call(panel.querySelectorAll('.card-list .card:not(.cat-hidden):not(.lg-hidden)'));
       var names = visible.slice(0, 5).map(function(card) {{
         return card.querySelector('.name').childNodes[0].textContent.trim();
       }});
@@ -2835,6 +3259,61 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
         + '\\n\\n더 많은 순위를 보고싶다면?\\n' + SITE_URL;
       copyTextWithFeedback(text, btn);
     }}
+
+    // --- 즐겨찾기 열기: 예전의 탭 버튼을 대신하는 유틸리티 줄 버튼.
+    // 지역 탭들의 active를 지우고 즐겨찾기 패널만 보여준다 (탭 줄에서 아무
+    // 지역이나 누르면 자연스럽게 빠져나가진다) ---
+    function openFavoritesTab() {{
+      document.querySelectorAll('.tab-btn').forEach(function(b) {{ b.classList.remove('active'); }});
+      document.querySelectorAll('.tab-panel').forEach(function(p) {{ p.classList.remove('active'); }});
+      var panel = document.getElementById('tab-favorites');
+      if (panel) panel.classList.add('active');
+      var tabsEl = document.querySelector('.tabs');
+      if (tabsEl && window.scrollY > tabsEl.offsetTop) {{
+        window.scrollTo(0, tabsEl.offsetTop);
+      }}
+    }}
+
+    // --- "협찬 포함" 토글: 내돈내산 지수 미달로 기본 숨김(lg-hidden)인 카드들을
+    // 보이게/안 보이게 전환한다. 서버 재호출 없이 이미 구워진 카드의 클래스만
+    // 바꾸는 방식. 보이는 카드 구성이 바뀌므로 각 패널을 현재 활성 정렬 기준으로
+    // 재배열하고 순위 번호도 다시 매긴다. 상태는 다크모드처럼 localStorage에 저장 ---
+    function applySponsoredMode(on) {{
+      // 즐겨찾기 탭의 복제 카드는 대상에서 제외한다 (유저가 직접 고른 목록이라
+      // 토글과 무관하게 항상 표시 - 복제 시 lg-card를 벗기지만 이중 방어)
+      document.querySelectorAll('.tab-panel:not(#tab-favorites) .card.lg-card').forEach(function(c) {{
+        c.classList.toggle('lg-hidden', !on);
+      }});
+      document.querySelectorAll('.lg-toggle-btn').forEach(function(b) {{
+        b.classList.toggle('active', on);
+      }});
+      document.querySelectorAll('.tab-panel').forEach(function(panel) {{
+        if (panel.id === 'tab-favorites') return;  // 즐겨찾기 탭은 개인 목록이라 제외
+        var activeSort = panel.querySelector('.sort-btn.active');
+        if (activeSort) {{
+          sortByMetric(activeSort);  // 새로 보이는 카드까지 현재 기준으로 재정렬+번호 재계산
+        }} else {{
+          renumberVisibleRanks(panel);
+        }}
+        updateWorldcupButton(panel);  // 보이는 카드 수가 바뀌면 월드컵 버튼 조건도 갱신
+      }});
+    }}
+
+    function toggleSponsored(btn) {{
+      var on = !btn.classList.contains('active');
+      try {{
+        localStorage.setItem('naver_trend_show_sponsored', on ? '1' : '0');
+      }} catch (e) {{ /* 프라이빗 모드 등: 저장만 실패, 이번 세션 토글은 동작 */ }}
+      applySponsoredMode(on);
+    }}
+
+    // 페이지 로드 시 저장된 토글 상태 복원 (기본은 꺼짐 - 서버가 lg-hidden으로
+    // 구워뒀으므로 켜져 있던 사용자만 여기서 한 번 벗겨준다)
+    try {{
+      if (localStorage.getItem('naver_trend_show_sponsored') === '1') {{
+        applySponsoredMode(true);
+      }}
+    }} catch (e) {{ }}
 
     // ==================== 롤링 전광판 (순수 자동 순환) ====================
     // 슬라이드 문구는 백엔드가 미리 구워뒀고, 여기서는 7초마다 전환만 한다.
@@ -2870,13 +3349,13 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
     function updateWorldcupButton(panel) {{
       var wcBtn = panel.querySelector('.wc-btn');
       if (!wcBtn) return;
-      var visibleCount = panel.querySelectorAll('.card-list .card:not(.cat-hidden)').length;
+      var visibleCount = panel.querySelectorAll('.card-list .card:not(.cat-hidden):not(.lg-hidden)').length;
       wcBtn.classList.toggle('hidden', visibleCount < 4);
     }}
 
     function startWorldcup(btn) {{
       var panel = btn.closest('.tab-panel');
-      var visible = Array.prototype.slice.call(panel.querySelectorAll('.card-list .card:not(.cat-hidden)'));
+      var visible = Array.prototype.slice.call(panel.querySelectorAll('.card-list .card:not(.cat-hidden):not(.lg-hidden)'));
       if (visible.length < 4) return;
       var size = visible.length >= 8 ? 8 : 4;  // 8개 이상=8강, 4~7개=4강
       var entrants = visible.slice(0, size).map(function(card) {{
@@ -2942,6 +3421,13 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
       document.getElementById('wc-round-label').textContent = '🏆 이주의 핫플 월드컵 우승!';
       document.getElementById('wc-match').style.display = 'none';
       document.getElementById('wc-winner-name').textContent = winner.name;
+      // 우승 화면에도 지역 · 카테고리 서브라인 표시 (대진 버튼과 같은 정보원)
+      var wcMeta = winner.region
+        ? winner.region + (winner.category ? ' · ' + winner.category : '')
+        : (winner.category || '');
+      var wcSub = document.getElementById('wc-winner-sub');
+      wcSub.textContent = wcMeta;
+      wcSub.style.display = wcMeta ? '' : 'none';
       document.getElementById('wc-winner-map').href = winner.url;
       document.getElementById('wc-winner').style.display = '';
     }}
@@ -3125,6 +3611,14 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
 </body>
 </html>"""
 
+    # 출력 경량화: 통짜 주석 줄/들여쓰기/빈 줄 제거 (소스 주석은 유지).
+    # config의 MINIFY_OUTPUT = False로 끄면 디버깅용 원본 그대로 저장된다.
+    if MINIFY_OUTPUT:
+        before = len(html.encode("utf-8"))
+        html = _slim_html(html)
+        after = len(html.encode("utf-8"))
+        print(f"[경량화] {before/1024:.0f}KB -> {after/1024:.0f}KB "
+              f"({(1-after/before)*100:.0f}% 절감)")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"\n완료: {out_path} 생성됨 (탭 {len(tab_names)}개: {', '.join(tab_names)})")
@@ -3133,6 +3627,16 @@ def render_html(tabs: dict, total_filtered: int = 0, out_path: str = "index.html
 if __name__ == "__main__":
     # 실제 실행 순서 (python fetch_and_build.py 했을 때 위에서 아래로 벌어지는 일):
 
+    # 0) 품질 게이트 준비: 직전 실행의 식당 수를 미리 읽어둔다 (trend_history의
+    #    prev_ranks가 직전 실행 결과 그 자체다). build_ranking()이 이 파일을
+    #    덮어쓰기 전에 읽어야 하므로 반드시 맨 앞에서 캡처한다.
+    _prev_result_count = 0
+    try:
+        with open(TREND_HISTORY_FILE, "r", encoding="utf-8") as _f:
+            _prev_result_count = len(json.load(_f).get("prev_ranks", {}))
+    except (OSError, json.JSONDecodeError):
+        pass  # 첫 실행 등 - 게이트는 이전 데이터가 충분할 때만 동작
+
     # 1) 이번 실행에서 쓸 지역 목록을 확정한다.
     #    CANDIDATE_REGIONS를 설정 안 했으면 그냥 REGIONS를 그대로 쓰고,
     #    설정했으면 CORE_REGIONS + 화제성 상위 지역을 합쳐서 새로 만든다.
@@ -3140,6 +3644,19 @@ if __name__ == "__main__":
 
     # 2) 확정된 지역들을 돌면서 식당 후보 수집 -> 언급 수 집계 -> 급상승 순위 계산
     all_results, total_filtered = build_ranking()
+
+    # 2-0) 품질 게이트: 수집 결과가 직전 대비 급감했다면(API 부분 장애 등)
+    #      반쪽짜리 페이지를 배포하는 대신 여기서 실패로 종료한다.
+    #      -> 워크플로우의 이후 단계(기록 저장/배포)가 전부 중단되어
+    #         라이브 사이트와 data 브랜치가 직전 정상 상태 그대로 유지된다.
+    #      QUALITY_GUARD_MIN_RATIO = 0 으로 끌 수 있고, 이전 데이터가 20곳
+    #      미만이면(초기 구축기) 게이트를 걸지 않는다.
+    if (QUALITY_GUARD_MIN_RATIO > 0 and _prev_result_count >= 20
+            and len(all_results) < _prev_result_count * QUALITY_GUARD_MIN_RATIO):
+        print(f"\n❌ [품질 게이트] 수집 식당 {len(all_results)}곳 - 직전 실행 "
+              f"{_prev_result_count}곳의 {QUALITY_GUARD_MIN_RATIO*100:.0f}% 미만으로 급감. "
+              f"API 장애 가능성이 높아 배포를 중단합니다 (기존 페이지 유지).")
+        sys.exit(1)
 
     # 2-1) (선택 기능, 기본 꺼짐) 상위 몇 개 식당만 데이터랩으로 실제 검색 관심도 추가 확인
     apply_search_trends(all_results, kst_today())
