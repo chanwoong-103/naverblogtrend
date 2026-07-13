@@ -86,6 +86,18 @@ jobs:
           NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
           NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
         run: python fetch_and_build.py
+        # 참고: 스크립트 안에 1차 품질 게이트가 있다 - 수집 식당 수가 직전 대비
+        # 급감하면(QUALITY_GUARD_MIN_RATIO, API 부분 장애 신호) exit 1로 종료되어
+        # 아래 모든 단계가 중단되고 라이브 사이트/data 브랜치는 직전 상태를 유지한다.
+
+      # 2차 품질 게이트: 생성된 index.html을 헤드리스 DOM(jsdom)에 실제로 띄워
+      # 탭 전환/정렬/협찬 토글/순위 번호 같은 핵심 상호작용이 살아있는지 검증한다.
+      # 특정 날짜의 데이터에 의존하지 않는 불변식만 검사하므로 어떤 날에도 유효.
+      # 하나라도 실패하면 배포가 중단된다 (Node는 러너에 기본 설치되어 있음).
+      - name: 렌더 스모크 테스트 (통과해야 배포)
+        run: |
+          npm install jsdom --no-save --silent
+          node smoke_test.js index.html
 
       # 갱신된 기록 파일들을 "data" 브랜치에 저장한다.
       # - main에 커밋하지 않으므로 코드 수정 이력이 데이터 커밋(하루 12개)에
